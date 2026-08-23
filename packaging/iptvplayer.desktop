@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=IPTV Player
+GenericName=IPTV Client
+Comment=Watch IPTV channels, movies and series with VLC playback
+Exec=IPTVPlayer
+Icon=iptvplayer
+Terminal=false
+Categories=AudioVideo;Video;Player;TV;
+Keywords=IPTV;TV;Xtream;M3U;VLC;Streaming;Subtitles;
+StartupWMClass=IPTVPlayer

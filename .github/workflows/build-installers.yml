@@ -1,0 +1,209 @@
+name: Build installers
+
+# Builds the macOS .dmg, the Windows .exe installer and the Linux AppImage.
+#
+# PyInstaller cannot cross-compile, so each artifact is built on its own runner.
+# Push a tag (v1.0.0) to attach them all to a GitHub Release, or run the
+# workflow manually and download them from the run's Artifacts section.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14      # Apple Silicon
+            arch: arm64
+          - runner: macos-13      # Intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller Pillow
+
+      - name: Build DMG
+        env:
+          PYTHON: python
+        run: |
+          chmod +x packaging/build_macos.sh
+          ./packaging/build_macos.sh
+
+      - name: Verify the frozen app
+        # VLC is absent on the runner; the self-test reports that without
+        # failing, since VLC is the end user's to install.
+        run: ./"dist/IPTV Player.app/Contents/MacOS/IPTVPlayer" --selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Player-macOS-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller Pillow
+
+      - name: Generate icons
+        run: python packaging/make_icons.py
+
+      - name: Build executable
+        run: python -m PyInstaller packaging/iptvplayer.spec --noconfirm --log-level WARN
+
+      - name: Verify the frozen executable
+        run: |
+          .\dist\IPTVPlayer\IPTVPlayer.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "self-test failed" }
+
+      - name: Build installer
+        # The runner image ships Inno Setup, but do not depend on that: a runner
+        # image change would otherwise break the job with no other symptom.
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            Write-Host "Inno Setup missing from the runner image - installing"
+            choco install innosetup -y --no-progress
+          }
+          & $iscc packaging\windows_installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Player-Windows-x64
+          path: dist/*Setup.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux (x86_64)
+    # Deliberately pinned, NOT ubuntu-latest. A binary built on 24.04 needs
+    # glibc 2.39 and will not start on Ubuntu 22.04, Debian 12 or Mint 21 -
+    # while building perfectly cleanly. 22.04 ships glibc 2.35 and covers them.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # libxcb-cursor0 is what Qt 6's xcb platform plugin links and PySide6
+          # does not ship; build_linux.sh copies it into the AppDir.
+          sudo apt-get install -y --no-install-recommends \
+            libxcb-cursor0 libxcb-util1 libfuse2 desktop-file-utils \
+            libegl1 libxkbcommon-x11-0
+
+      - name: Fetch appimagetool
+        run: |
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          echo "APPIMAGETOOL=$PWD/appimagetool" >> "$GITHUB_ENV"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller Pillow
+
+      - name: Validate the desktop entry
+        run: desktop-file-validate packaging/iptvplayer.desktop
+
+      - name: Build AppImage
+        env:
+          PYTHON: python
+        run: |
+          chmod +x packaging/build_linux.sh
+          ./packaging/build_linux.sh
+
+      - name: Verify the AppImage
+        # The only proof the artifact actually starts - it cannot be run on the
+        # developer's Mac. VLC is absent here, which the self-test reports
+        # without failing, since VLC is the end user's to install.
+        run: |
+          chmod +x dist/IPTV_Player-*.AppImage
+          ./dist/IPTV_Player-*.AppImage --appimage-extract-and-run --selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Player-Linux-x86_64
+          path: |
+            dist/*.AppImage
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    needs: [macos, windows, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*Setup.exe
+            artifacts/**/*.AppImage
+            artifacts/**/*.tar.gz
+          body: |
+            ## IPTV Player ${{ github.ref_name }}
+
+            | Platform | File |
+            |---|---|
+            | Windows 64-bit | `IPTV-Player-*-Windows-x64-Setup.exe` |
+            | macOS (Apple Silicon) | `IPTV-Player-*-macOS-arm64.dmg` |
+            | macOS (Intel) | `IPTV-Player-*-macOS-x86_64.dmg` |
+            | Linux x86_64 | `IPTV_Player-*-x86_64.AppImage` |
+            | Linux x86_64 (fallback) | `IPTV-Player-*-linux-x86_64.tar.gz` |
+
+            **VLC is required.** This player uses VLC's engine to decode video.
+            Install VLC (64-bit on Windows) from https://www.videolan.org/vlc/
+            before first launch. On Linux: `sudo apt install vlc`.
+
+            These builds are unsigned. macOS: right-click the app and choose
+            **Open** the first time. Windows: click **More info → Run anyway**
+            on the SmartScreen prompt.
+
+            The AppImage needs FUSE, which Ubuntu 22.04+ and Fedora no longer
+            install by default. If it will not start, either
+            `sudo apt install libfuse2` or use the `.tar.gz`, which just
+            extracts and runs.
+
+            Built on Ubuntu 22.04 (glibc 2.35), so the Linux builds run on
+            Ubuntu 22.04+, Debian 12+ and equivalents.

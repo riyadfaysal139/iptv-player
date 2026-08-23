@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metainfo. appimagetool warns without it, and Linux software centres
+  read it to describe the app. The "requires VLC" note lives here too, because
+  this is where a user browsing a store will actually see it.
+-->
+<component type="desktop-application">
+  <id>com.iptvplayer.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>IPTV Player</name>
+  <summary>Watch IPTV channels, movies and series with VLC playback</summary>
+
+  <description>
+    <p>
+      A desktop IPTV client for Xtream Codes and M3U providers. It organises a
+      provider's flat channel list into a TV / Movies / Series tree, plays
+      through VLC's engine in an embedded window, downloads movies and episodes
+      for offline viewing, and fetches subtitles from OpenSubtitles using the
+      same keyless protocol as VLC's VLSub extension.
+    </p>
+    <p>
+      Built for large catalogs: tens of thousands of items are kept in SQLite
+      and rendered through virtualized views, so memory stays flat no matter how
+      big the list is.
+    </p>
+    <p>
+      VLC must be installed separately — this player uses its decoding engine
+      but does not redistribute VideoLAN's binaries.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">iptvplayer.desktop</launchable>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+    <category>Player</category>
+    <category>TV</category>
+  </categories>
+
+  <provides>
+    <binary>IPTVPlayer</binary>
+  </provides>
+
+  <releases>
+    <release version="1.0.0" date="2026-08-23">
+      <description>
+        <p>Full VLC control bar, keyless VLSub subtitles, daily catalog updates
+        and resumable downloads.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+</component>

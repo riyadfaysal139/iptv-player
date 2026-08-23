@@ -1,0 +1,22 @@
+# Build outputs
+build/
+dist/
+AppDir/
+*.dmg
+*.AppImage
+*.tar.gz
+*.spec.bak
+assets/icon.iconset/
+
+# Python. .pyc files embed the absolute path of the source they were compiled
+# from, so committing one publishes a local filesystem path.
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime data — never belongs in the repository.
+*.sqlite*
+
+# Machine-local tool and OS metadata
+.claude/
+.DS_Store
