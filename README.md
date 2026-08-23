@@ -26,7 +26,7 @@ it uses your VLC install. Get it from <https://www.videolan.org/vlc/>.
 
 ### macOS
 
-1. Open `IPTV-Player-1.0.0-macOS-<arch>.dmg`
+1. Open `IPTV-Player-1.1.0-macOS-<arch>.dmg`
 2. Drag **IPTV Player** onto **Applications**
 3. **First launch only:** right-click (or Control-click) the app in Applications
    and choose **Open**, then confirm. The build is unsigned, so a normal
@@ -35,7 +35,7 @@ it uses your VLC install. Get it from <https://www.videolan.org/vlc/>.
 
 ### Windows
 
-1. Run `IPTV-Player-1.0.0-Windows-x64-Setup.exe`
+1. Run `IPTV-Player-1.1.0-Windows-x64-Setup.exe`
 2. SmartScreen will warn about an unrecognised app — click **More info → Run
    anyway** (again, unsigned).
 3. The installer checks for VLC and points you at the download if it is missing
@@ -49,8 +49,8 @@ videos.
 ### Linux
 
 ```sh
-chmod +x IPTV_Player-1.0.0-x86_64.AppImage
-./IPTV_Player-1.0.0-x86_64.AppImage
+chmod +x IPTV_Player-1.1.0-x86_64.AppImage
+./IPTV_Player-1.1.0-x86_64.AppImage
 ```
 
 Install VLC first — `sudo apt install vlc`, `sudo dnf install vlc`, or your

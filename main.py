@@ -93,7 +93,28 @@ def selftest() -> int:
     except Exception as exc:
         print(f"opensubtitles: unreachable ({type(exc).__name__}) — offline?")
 
+    import platform
+
     lib_dir, plugin_dir = vlc_setup.find_vlc()
+
+    # On macOS an architecture mismatch is the failure that looks like a broken
+    # build but is not one, so name both architectures outright. It also tells
+    # the arm64 and x86_64 CI jobs apart, which are otherwise identical.
+    if sys.platform == "darwin":
+        mine = platform.machine()
+        theirs = set()
+        for name in ("libvlc.dylib", "libvlc.5.dylib"):
+            theirs = vlc_setup.macho_arches(lib_dir / name) if lib_dir else set()
+            if theirs:
+                break
+        if not lib_dir:
+            print(f"architecture : app {mine}, VLC absent")
+        elif theirs:
+            verdict = "match" if mine in theirs else "MISMATCH"
+            print(f"architecture : app {mine}, VLC {'/'.join(sorted(theirs))} — {verdict}")
+        else:
+            print(f"architecture : app {mine}, VLC unreadable")
+
     if lib_dir:
         print(f"libVLC       : {lib_dir}")
         print(f"loads        : {vlc_setup.ensure_vlc()}")

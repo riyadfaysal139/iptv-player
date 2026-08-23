@@ -45,6 +45,14 @@
   </provides>
 
   <releases>
+    <release version="1.1.0" date="2026-08-23">
+      <description>
+        <p>VLC's keyboard controls: left and right arrows seek ten seconds, up
+        and down arrows change the volume, and space reliably plays and pauses.
+        A clear message when the installed VLC does not match the app's
+        processor architecture.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-08-23">
       <description>
         <p>Full VLC control bar, keyless VLSub subtitles, daily catalog updates

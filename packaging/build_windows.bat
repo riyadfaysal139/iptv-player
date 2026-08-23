@@ -3,7 +3,7 @@ REM Build the Windows installer.
 REM
 REM   packaging\build_windows.bat
 REM
-REM Produces dist\IPTV-Player-1.0.0-Windows-x64-Setup.exe
+REM Produces dist\IPTV-Player-1.1.0-Windows-x64-Setup.exe
 REM
 REM Requirements:
 REM   * 64-bit Python 3.10-3.14   https://www.python.org/downloads/windows/

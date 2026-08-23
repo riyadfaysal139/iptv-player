@@ -9,10 +9,20 @@ from __future__ import annotations
 
 import ctypes
 import os
+import platform
+import struct
 import sys
 from pathlib import Path
 
 DOWNLOAD_URL = "https://www.videolan.org/vlc/"
+
+# Mach-O cpu_type_t values, from <mach/machine.h>. CPU_ARCH_ABI64 (0x01000000)
+# is or-ed into the base type for the 64-bit variants. Note arm64e shares
+# CPU_TYPE_ARM64 and is distinguished only by its cpusubtype, so it reads back
+# as "arm64" here — which is the safe direction: it can only ever suppress a
+# mismatch warning, never invent one.
+_CPU_TYPES = {0x0100000C: "arm64", 0x01000007: "x86_64", 0x00000007: "i386"}
+_ARCH_LABELS = {"arm64": "Apple Silicon", "x86_64": "Intel"}
 
 _state = {"loaded": False, "error": None, "lib_dir": None, "plugin_dir": None}
 
@@ -63,6 +73,56 @@ def _libnames():
     if os.name == "nt":
         return ["libvlc.dll"]
     return ["libvlc.so.5", "libvlc.so"]
+
+
+def macho_arches(path) -> set[str]:
+    """Architectures inside a Mach-O file, read straight from its header.
+
+    An Apple Silicon app cannot load an Intel-only libVLC, and dyld reports that
+    as an opaque "incompatible architecture" string. Reading the header lets the
+    app say which build of VLC is installed and which one is needed.
+
+    Anything unreadable or unrecognised gives an empty set, so a parsing failure
+    degrades to the plain error message rather than to a confident wrong claim.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+            if len(head) < 8:
+                return set()
+            magic = head[:4]
+            # Thin 64-bit image: MH_MAGIC_64/MH_CIGAM_64, cputype follows.
+            if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+                order = "<" if magic == b"\xcf\xfa\xed\xfe" else ">"
+                (cpu,) = struct.unpack(order + "I", head[4:8])
+                name = _CPU_TYPES.get(cpu)
+                return {name} if name else set()
+            # Universal ("fat") binary: a big-endian count, then one 20-byte
+            # fat_arch per slice with cputype first.
+            if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                order = ">" if magic == b"\xca\xfe\xba\xbe" else "<"
+                (count,) = struct.unpack(order + "I", head[4:8])
+                if not 0 < count <= 32:  # a sane cap; a real fat file has a few
+                    return set()
+                table = handle.read(20 * count)
+                if len(table) < 20 * count:
+                    return set()
+                found = set()
+                for index in range(count):
+                    (cpu,) = struct.unpack(order + "I", table[20 * index:20 * index + 4])
+                    name = _CPU_TYPES.get(cpu)
+                    if name:
+                        found.add(name)
+                return found
+    except OSError:
+        pass
+    return set()
+
+
+def arch_label(arch: str) -> str:
+    """'arm64' -> 'Apple Silicon (arm64)', for messages aimed at users."""
+    friendly = _ARCH_LABELS.get(arch)
+    return f"{friendly} ({arch})" if friendly else arch
 
 
 def _corenames():
@@ -152,9 +212,11 @@ def ensure_vlc() -> bool:
                 continue
 
     loaded_path = None
+    library_path = None  # the file we tried, whether or not it actually loaded
     for name in _libnames():
         target = lib_dir / name
         if target.exists():
+            library_path = library_path or target
             try:
                 ctypes.CDLL(str(target), mode=getattr(ctypes, "RTLD_GLOBAL", 0))
                 loaded_path = target
@@ -179,6 +241,21 @@ def ensure_vlc() -> bool:
                 f"present.\n\nInstall the {bits}-bit build from {DOWNLOAD_URL} "
                 "(choose the Windows 64bit installer) and restart."
             )
+        elif sys.platform == "darwin":
+            # The macOS equivalent: an Apple Silicon app cannot load an Intel
+            # VLC. Only claim a mismatch when the header parsed and genuinely
+            # disagrees — otherwise dyld's own message stands unaltered.
+            want = platform.machine()
+            have = macho_arches(library_path) if library_path else set()
+            if have and want not in have:
+                theirs = " or ".join(arch_label(a) for a in sorted(have))
+                hint = (
+                    f"\n\nThis app is {arch_label(want)}, but the VLC installed "
+                    f"at {library_path} is {theirs} only. The two cannot be "
+                    "mixed, even though VLC is present.\n\nDownload the "
+                    f"{arch_label(want)} build of VLC from {DOWNLOAD_URL} and "
+                    "restart."
+                )
         _state["error"] = f"VLC was found at {lib_dir} but could not be loaded:\n{exc}{hint}"
         return False
 

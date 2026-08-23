@@ -441,6 +441,92 @@ class TestSeekClamp(unittest.TestCase):
         self.assertEqual(self.clamp(200, 10, 500), 0)
 
 
+class TestMachOArches(unittest.TestCase):
+    """Reading a Mach-O header to explain an architecture mismatch.
+
+    An Apple Silicon app cannot load an Intel libVLC, and dyld only says
+    "incompatible architecture". Naming the two builds is only helpful if the
+    parse is right — a wrong answer ("your VLC is Intel" when it is not) is
+    worse than the raw error, so the header is built here from known bytes
+    rather than read off whichever machine happens to run the tests.
+    """
+
+    ARM64 = 0x0100000C
+    X86_64 = 0x01000007
+
+    def setUp(self):
+        import struct
+        import tempfile
+
+        from core import vlc_setup
+
+        self.struct = struct
+        self.arches = vlc_setup.macho_arches
+        self.dir = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _write(self, data: bytes) -> Path:
+        path = self.dir / "libvlc.dylib"
+        path.write_bytes(data)
+        return path
+
+    def _thin(self, cpu: int, little: bool = True) -> bytes:
+        magic = b"\xcf\xfa\xed\xfe" if little else b"\xfe\xed\xfa\xcf"
+        order = "<" if little else ">"
+        # magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, pad
+        return magic + self.struct.pack(order + "7I", cpu, 0, 6, 0, 0, 0, 0) + b"\0" * 32
+
+    def _fat(self, cpus) -> bytes:
+        out = b"\xca\xfe\xba\xbe" + self.struct.pack(">I", len(cpus))
+        for cpu in cpus:
+            # cputype, cpusubtype, offset, size, align
+            out += self.struct.pack(">5I", cpu, 0, 4096, 100, 12)
+        return out + b"\0" * 64
+
+    def test_thin_apple_silicon(self):
+        self.assertEqual(self.arches(self._write(self._thin(self.ARM64))), {"arm64"})
+
+    def test_thin_intel(self):
+        self.assertEqual(self.arches(self._write(self._thin(self.X86_64))), {"x86_64"})
+
+    def test_universal_binary_reports_every_slice(self):
+        path = self._write(self._fat([self.X86_64, self.ARM64]))
+        self.assertEqual(self.arches(path), {"x86_64", "arm64"})
+
+    def test_byte_swapped_header_is_still_read(self):
+        self.assertEqual(self.arches(self._write(self._thin(self.ARM64, little=False))), {"arm64"})
+
+    def test_the_mismatch_this_exists_to_catch(self):
+        """An Intel-only VLC on an Apple Silicon app: the set must not contain
+        the running architecture, which is what triggers the hint."""
+        have = self.arches(self._write(self._thin(self.X86_64)))
+        self.assertTrue(have)
+        self.assertNotIn("arm64", have)
+
+    def test_unknown_cpu_type_is_not_guessed_at(self):
+        self.assertEqual(self.arches(self._write(self._thin(0x0BADF00D))), set())
+
+    def test_garbage_and_truncation_stay_silent(self):
+        """Every one of these must give an empty set, never an exception: the
+        caller treats empty as 'say nothing' and falls back to dyld's message."""
+        self.assertEqual(self.arches(self._write(b"not a mach-o file at all")), set())
+        self.assertEqual(self.arches(self._write(b"")), set())
+        self.assertEqual(self.arches(self._write(b"\xcf\xfa")), set())
+        # A fat header whose table is cut short.
+        self.assertEqual(self.arches(self._write(b"\xca\xfe\xba\xbe" + self.struct.pack(">I", 3))), set())
+        # An absurd slice count, which would otherwise mean a huge read.
+        self.assertEqual(self.arches(self._write(b"\xca\xfe\xba\xbe" + self.struct.pack(">I", 2**31))), set())
+        self.assertEqual(self.arches(self._write(b"\xca\xfe\xba\xbe" + self.struct.pack(">I", 0))), set())
+
+    def test_a_missing_or_unreadable_path_is_not_an_error(self):
+        self.assertEqual(self.arches(self.dir / "nothing-here.dylib"), set())
+        self.assertEqual(self.arches(self.dir), set())  # a directory
+
+
 class TestSubtitleHash(unittest.TestCase):
     """The remote hash is the whole basis of VLSub's exact match.
 
