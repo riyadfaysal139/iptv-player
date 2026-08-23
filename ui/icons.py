@@ -182,6 +182,14 @@ def _volume_muted(p, c):
     p.drawLine(QPointF(90, 36), QPointF(64, 64))
 
 
+def _pip(p, c):
+    """A screen with a smaller picture inset at the bottom right."""
+    _stroke(p, c, 8)
+    p.drawRoundedRect(QRectF(12, 22, 76, 56), 9, 9)
+    _fill(p, c)
+    p.drawRoundedRect(QRectF(48, 46, 32, 24), 4, 4)
+
+
 def _subtitles(p, c):
     _stroke(p, c, 8)
     p.drawRoundedRect(QRectF(10, 22, 80, 56), 9, 9)
@@ -207,6 +215,7 @@ SHAPES = {
     "previous": _previous,
     "next": _next,
     "fullscreen": _fullscreen,
+    "pip": _pip,
     "effects": _effects,
     "playlist": _playlist,
     "loop": _loop,

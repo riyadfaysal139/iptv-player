@@ -100,6 +100,7 @@ class PlayerWidget(QWidget):
     playbackStarted = Signal()
     playbackStopped = Signal()
     fullscreenToggled = Signal()
+    videoDoubleClicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -155,7 +156,9 @@ class PlayerWidget(QWidget):
         self._stack.setContentsMargins(0, 0, 0, 0)
 
         self.surface = VideoSurface()
-        self.surface.doubleClicked.connect(self.fullscreenToggled)
+        # Not wired straight to fullscreen: what a double-click should do
+        # depends on the window mode, which only MainWindow knows.
+        self.surface.doubleClicked.connect(self.videoDoubleClicked)
 
         self.overlay = QLabel("")
         self.overlay.setObjectName("playerOverlay")
@@ -249,6 +252,16 @@ class PlayerWidget(QWidget):
             self.player.set_hwnd(handle)
         else:
             self.player.set_xwindow(handle)
+
+    def reattach_surface(self):
+        """Re-bind libVLC to the surface after its native handle was recreated.
+
+        Only needed if a window-level change (the Picture-in-Picture stay-on-top
+        flag) makes Qt rebuild the native window. On macOS/Qt 6 it does not, but
+        the caller checks the handle and this is what it calls when it did.
+        """
+        if self.player is not None:
+            self._attach_surface()
 
     def _attach_events(self):
         vlc = self._vlc

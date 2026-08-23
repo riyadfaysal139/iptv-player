@@ -441,6 +441,61 @@ class TestSeekClamp(unittest.TestCase):
         self.assertEqual(self.clamp(200, 10, 500), 0)
 
 
+class TestPipRect(unittest.TestCase):
+    """Where the Picture-in-Picture window lands.
+
+    Pure arithmetic in ui/main_window.py so the corner cases can be checked
+    without a display — the same reason clamp_seek lives at module level.
+    """
+
+    def setUp(self):
+        from ui.main_window import PIP_WIDTH, pip_rect
+
+        self.rect = pip_rect
+        self.default_width = PIP_WIDTH
+        self.screen = (0, 0, 1920, 1080)
+
+    def test_sits_in_the_bottom_right_with_its_margin(self):
+        x, y, w, h = self.rect(self.screen, width=560, margin=24)
+        self.assertEqual((w, h), (560, 315))                 # 16:9
+        self.assertEqual(x, 1920 - 560 - 24)
+        self.assertEqual(y, 1080 - 315 - 24)
+
+    def test_screen_origin_is_respected(self):
+        """A second monitor's area does not start at (0, 0)."""
+        x, y, w, h = self.rect((1920, -200, 1280, 800), width=560, margin=24)
+        self.assertEqual(x, 1920 + 1280 - 560 - 24)
+        self.assertEqual(y, -200 + 800 - 315 - 24)
+
+    def test_width_wider_than_the_screen_is_clamped(self):
+        x, y, w, h = self.rect((0, 0, 480, 320), width=1200, margin=24)
+        self.assertLessEqual(w, 480)
+        self.assertLessEqual(h, 320)
+        self.assertGreaterEqual(x, 0)
+        self.assertGreaterEqual(y, 0)
+
+    def test_never_starts_off_the_screen(self):
+        """The margin gives way rather than pushing the window out of view."""
+        for screen in ((0, 0, 1920, 1080), (0, 0, 600, 340), (0, 0, 560, 315),
+                       (100, 50, 640, 400)):
+            for width in (320, 560, 900, 4000):
+                x, y, w, h = self.rect(screen, width=width, margin=24)
+                sx, sy, sw, sh = screen
+                self.assertGreaterEqual(x, sx, (screen, width))
+                self.assertGreaterEqual(y, sy, (screen, width))
+                self.assertLessEqual(x + w, sx + sw, (screen, width))
+                self.assertLessEqual(y + h, sy + sh, (screen, width))
+
+    def test_a_short_screen_gives_up_the_aspect_before_going_off_screen(self):
+        x, y, w, h = self.rect((0, 0, 1920, 200), width=560, margin=0)
+        self.assertLessEqual(h, 200)
+        self.assertLessEqual(y + h, 200)
+
+    def test_default_width_is_wide_enough_for_the_bar(self):
+        """The bar's main row needs roughly 490px; the default must clear it."""
+        self.assertGreaterEqual(self.default_width, 500)
+
+
 class TestMachOArches(unittest.TestCase):
     """Reading a Mach-O header to explain an architecture mismatch.
 

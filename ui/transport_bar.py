@@ -187,6 +187,7 @@ class TransportBar(QWidget):
     recordRequested = Signal()
     playlistToggled = Signal()
     fullscreenRequested = Signal()
+    pipRequested = Signal()
     effectsRequested = Signal()
     subtitleSearchRequested = Signal()
     subtitleFileRequested = Signal()
@@ -296,6 +297,11 @@ class TransportBar(QWidget):
 
         self.btn_full = TransportButton("fullscreen", "Fullscreen  (F)")
         self.btn_full.clicked.connect(self.fullscreenRequested)
+        # Latching, because it is a mode: the window can also be put into and
+        # taken out of it by the menu, P, Escape and double-click, so the state
+        # is pushed back here with set_pip() rather than tracked locally.
+        self.btn_pip = ToggleButton("pip", "Picture-in-Picture  (P)")
+        self.btn_pip.clicked.connect(self.pipRequested)
         self.btn_effects = TransportButton("effects", "Adjustments and effects")
         self.btn_effects.clicked.connect(self.effectsRequested)
         self.btn_playlist = TransportButton("playlist", "Show or hide the browser")
@@ -317,6 +323,7 @@ class TransportBar(QWidget):
         row.addWidget(self.btn_stop)
         row.addWidget(self._separator())
         row.addWidget(self.btn_full)
+        row.addWidget(self.btn_pip)
         row.addWidget(self.btn_effects)
         row.addWidget(self.btn_playlist)
         row.addWidget(self._separator())
@@ -394,6 +401,12 @@ class TransportBar(QWidget):
                                 icons.ACCENT if muted else icons.FG)
         self.btn_mute.set_on(muted)
         self.btn_mute.setToolTip("Unmute" if muted else "Mute")
+
+    def set_pip(self, on: bool):
+        """Latch the PiP button to match the window's actual mode."""
+        self.btn_pip.set_on(bool(on))
+        self.btn_pip.setToolTip("Leave Picture-in-Picture  (P)" if on
+                                else "Picture-in-Picture  (P)")
 
     def nudge_volume(self, delta: int) -> int:
         """Step the volume and return the new level.

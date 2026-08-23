@@ -194,13 +194,13 @@ in the same order:
 ```
  00:42:17  ═══════════●───────────────────────────  −01:05:33
  ● 📷 ▣ A↔B                        1.00x  Auto  AUDIO  SUBS
- ▶ ⏮ ⏭ ■ │ ⛶ ⚙ ☰ │ ⟲ ⇄                        🔊 ▬▬▬●──
+ ▶ ⏮ ⏭ ■ │ ⛶ ⧉ ⚙ ☰ │ ⟲ ⇄                      🔊 ▬▬▬●──
 ```
 
 Play/pause, previous/next through the current list, stop, click-anywhere seek
 with a hover preview of the target time, elapsed and remaining (click to switch
-to total), fullscreen, **Adjustments and Effects**, show/hide the browser,
-three-state loop, random, mute and volume. The middle row is VLC's *advanced
+to total), fullscreen, Picture-in-Picture, **Adjustments and Effects**,
+show/hide the browser, three-state loop, random, mute and volume. The middle row is VLC's *advanced
 controls* — record, snapshot, frame-step, A↔B loop, playback speed, aspect
 ratio/crop/deinterlace, and the audio and subtitle track menus — and hides from
 **View ▸ Advanced controls**, as in VLC.
@@ -218,6 +218,7 @@ live channels.
 | `M` | Mute |
 | `[` `]` | Speed down / up · `=` normal speed |
 | `F` | Fullscreen · `Esc` leaves it |
+| `P` | Picture-in-Picture · `Esc` leaves it |
 | `Ctrl+L` | Show or hide the browser |
 
 `Space`, `M` and the speed keys work wherever you are in the app — they are
@@ -232,7 +233,8 @@ channel list. Whoever has focus gets them:
   clicking the video gets them back.
 - **The list has focus** — arrows move through channels, as before. Click the
   list to browse.
-- **Fullscreen** — always the player, since there is no list to compete.
+- **Fullscreen or Picture-in-Picture** — always the player, since there is no
+  list to compete.
 - **Typing in a search box** — always the box. `Space` inserts a space and the
   arrows move the caret; the player does not interfere.
 
@@ -249,6 +251,21 @@ each new stream — libVLC drops them whenever the engine is rebuilt.
 In fullscreen the bar floats over the video as its own window, VLC-style, and
 fades out after a few idle seconds. If a window manager will not keep it above
 the video, set `fullscreen_floating_bar` to `0` in settings and it stays docked.
+
+### Picture-in-Picture
+
+The ⧉ button (or `P`) shrinks the window to a small player that stays above
+other applications, so a match keeps running while you work. Move and resize it
+by its frame; the size is remembered. The controls appear while the pointer is
+over it and get out of the way when it is not — the pointer moving elsewhere on
+the screen deliberately does *not* raise them. `P`, `Esc`, double-clicking the
+video or the button again gives the full window back, restoring the panes,
+splitter sizes and geometry exactly as they were.
+
+The video surface is never reparented for this — the window itself shrinks and
+its chrome is hidden, which is fullscreen's trick in reverse. libVLC is bound to
+the surface's native handle and moving it mid-playback would lose the drawable;
+this way playback simply continues, with no restart or black frame.
 
 The icons are drawn rather than typed: several transport glyphs live in
 Unicode's emoji block, so macOS and Windows render them in colour at their own

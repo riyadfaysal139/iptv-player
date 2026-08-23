@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QCursor, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QDialog, QHBoxLayout,
@@ -37,6 +37,28 @@ RESOLVED_TTL_SECONDS = 45      # CDN tokens verified good at 25 s; stay well ins
 PREFETCH_DELAY_MS = 180        # let arrow-key scrolling settle before resolving
 SEEK_STEP_SECONDS = 10         # VLC's short jump, on the left/right arrows
 VOLUME_STEP = 5                # matches the wheel step over the volume slider
+PIP_WIDTH = 560                # the main row of the bar needs ~490px to fit
+PIP_MARGIN = 24
+
+
+def pip_rect(screen, width: int = PIP_WIDTH, margin: int = PIP_MARGIN):
+    """Bottom-right 16:9 box inside `screen`, as (x, y, w, h).
+
+    `screen` is (x, y, w, h) of the available desktop area. Kept pure and free
+    of Qt so the corner arithmetic can be tested without a display, the same
+    way `clamp_seek` is.
+    """
+    sx, sy, sw, sh = (int(v) for v in screen)
+    width = max(160, min(int(width), sw))
+    height = int(round(width * 9 / 16))
+    if height > sh:                       # a very short screen wins over 16:9
+        height = sh
+        width = min(width, int(round(height * 16 / 9))) or width
+    margin = max(0, int(margin))
+    # Shrink the margin rather than push the window off the screen edge.
+    margin_x = min(margin, max(0, sw - width))
+    margin_y = min(margin, max(0, sh - height))
+    return (sx + sw - width - margin_x, sy + sh - height - margin_y, width, height)
 
 
 class SyncWorker(QObject):
@@ -171,6 +193,8 @@ class MainWindow(QMainWindow):
         self._effects_dialog = None
         self._browser_sizes = None
         self._fs_overlay = None
+        self._pip_state = None
+        self._pip_hold_ms = 0
 
         self.downloads = DownloadManager(db)
         self.downloads.start()
@@ -319,6 +343,7 @@ class MainWindow(QMainWindow):
         self.player.endReached.connect(self._on_end_reached)
         self.player.positionChanged.connect(self._remember_position)
         self.player.fullscreenToggled.connect(self.toggle_fullscreen)
+        self.player.videoDoubleClicked.connect(self._video_double_clicked)
         self._connect_transport(self.player.bar)
         right_layout.addWidget(self.player, 3)
 
@@ -385,6 +410,7 @@ class MainWindow(QMainWindow):
         bar.nextRequested.connect(lambda: self.step_item(1))
         bar.recordRequested.connect(self.download_current)
         bar.playlistToggled.connect(self.toggle_browser)
+        bar.pipRequested.connect(self.toggle_pip)
         bar.effectsRequested.connect(self.open_effects)
         bar.subtitleSearchRequested.connect(self.open_subtitles)
         bar.subtitleFileRequested.connect(self.open_subtitle_file)
@@ -453,6 +479,11 @@ class MainWindow(QMainWindow):
         fullscreen.setShortcut(QKeySequence("F"))
         fullscreen.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(fullscreen)
+
+        pip = QAction("Picture-in-Picture", self)
+        pip.setShortcut(QKeySequence("P"))
+        pip.triggered.connect(self.toggle_pip)
+        view_menu.addAction(pip)
 
         settings_menu = bar.addMenu("&Settings")
         self.hw_action = QAction("Hardware decoding", self, checkable=True)
@@ -959,8 +990,8 @@ class MainWindow(QMainWindow):
 
     def set_browser_visible(self, visible: bool):
         """The bar's ☰ button — VLC's "show playlist"."""
-        if self._fs_state:
-            return          # fullscreen owns pane visibility
+        if self._fs_state or self._pip_state:
+            return          # fullscreen and PiP own pane visibility
         if not visible and self._left_pane.isVisible():
             self._browser_sizes = self._splitter.sizes()
         self._left_pane.setVisible(visible)
@@ -1004,7 +1035,43 @@ class MainWindow(QMainWindow):
             return str(item.data(0, Qt.UserRole).get("episode_id", ""))
         return ""
 
-    # --------------------------------------------------------- fullscreen
+    # ------------------------------------------------- fullscreen and PiP
+
+    def _save_chrome(self) -> dict:
+        """Everything a window mode has to put back when it ends."""
+        return {
+            "sizes": self._splitter.sizes(),
+            "left": self._left_pane.isVisible(),
+            "middle": self._middle_pane.isVisible(),
+            "info": self._info_panel.isVisible(),
+            "top": self._top_bar.isVisible(),
+            # On macOS the menu bar is native (not a child widget), so it has
+            # no visibility to toggle; the OS hides it in fullscreen itself.
+            "menubar": None if self.menuBar().isNativeMenuBar()
+                       else self.menuBar().isVisible(),
+            "statusbar": self.statusBar().isVisible(),
+            "maximized": self.isMaximized(),
+            "geometry": self.saveGeometry(),
+            "advanced": self.player.bar.advanced_row.isVisible(),
+        }
+
+    def _hide_chrome(self):
+        for widget in (self._left_pane, self._middle_pane, self._info_panel,
+                       self._top_bar):
+            widget.hide()
+        if not self.menuBar().isNativeMenuBar():
+            self.menuBar().setVisible(False)
+        self.statusBar().setVisible(False)
+
+    def _restore_chrome(self, state: dict):
+        self._left_pane.setVisible(state["left"])
+        self._middle_pane.setVisible(state["middle"])
+        self._info_panel.setVisible(state["info"])
+        self._top_bar.setVisible(state["top"])
+        if state["menubar"] is not None:
+            self.menuBar().setVisible(state["menubar"])
+        self.statusBar().setVisible(state["statusbar"])
+        self.player.bar.set_advanced_visible(state["advanced"])
 
     def toggle_fullscreen(self):
         if self._fs_state:
@@ -1023,26 +1090,10 @@ class MainWindow(QMainWindow):
         """
         if self._fs_state or not self.player.available:
             return
-        self._fs_state = {
-            "sizes": self._splitter.sizes(),
-            "left": self._left_pane.isVisible(),
-            "middle": self._middle_pane.isVisible(),
-            "info": self._info_panel.isVisible(),
-            "top": self._top_bar.isVisible(),
-            # On macOS the menu bar is native (not a child widget), so it has
-            # no visibility to toggle; the OS hides it in fullscreen itself.
-            "menubar": None if self.menuBar().isNativeMenuBar()
-                       else self.menuBar().isVisible(),
-            "statusbar": self.statusBar().isVisible(),
-            "maximized": self.isMaximized(),
-            "geometry": self.saveGeometry(),
-        }
-        for widget in (self._left_pane, self._middle_pane, self._info_panel,
-                       self._top_bar):
-            widget.hide()
-        if not self.menuBar().isNativeMenuBar():
-            self.menuBar().setVisible(False)
-        self.statusBar().setVisible(False)
+        if self._pip_state:
+            self.exit_pip()
+        self._fs_state = self._save_chrome()
+        self._hide_chrome()
         self.showFullScreen()
         self._float_bar()
         # The overlay is a separate top-level and takes activation with it, so
@@ -1056,7 +1107,8 @@ class MainWindow(QMainWindow):
         self._fs_last_cursor = QCursor.pos()
         self._fs_timer.start()
 
-    def _float_bar(self):
+    def _float_bar(self, area=None, inset: int = 80, gap: int = 28,
+                   max_width: int = 1100):
         """Put the controls over the video, the way VLC's fullscreen does.
 
         A separate top-level window is the only thing that reliably draws above
@@ -1064,15 +1116,19 @@ class MainWindow(QMainWindow):
         not, because the video is a native child window. Safe to do because the
         bar owns no video handle. Set `fullscreen_floating_bar` to 0 to keep the
         old docked behaviour if a window manager will not honour stay-on-top.
+
+        `area` is the rectangle to sit at the bottom of: the whole screen for
+        fullscreen, the mini window's frame for Picture-in-Picture.
         """
         if not self.db.get_bool("fullscreen_floating_bar", True):
             return
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is None:
-            return
+        if area is None:
+            screen = self.screen() or QApplication.primaryScreen()
+            if screen is None:
+                return
+            area = screen.geometry()
 
-        area = screen.geometry()
-        width = min(1100, area.width() - 80)
+        width = max(200, min(max_width, area.width() - inset))
         left = area.x() + (area.width() - width) // 2
 
         overlay = QWidget(None, Qt.Tool | Qt.FramelessWindowHint
@@ -1092,7 +1148,7 @@ class MainWindow(QMainWindow):
 
         overlay.show()
         overlay.adjustSize()
-        overlay.move(left, area.y() + area.height() - overlay.height() - 28)
+        overlay.move(left, area.y() + area.height() - overlay.height() - gap)
         self._fs_overlay = overlay
 
     def _dock_bar(self):
@@ -1118,14 +1174,7 @@ class MainWindow(QMainWindow):
         self._restore_cursor()
         self._dock_bar()
         self.player.set_chrome_visible(True)
-
-        self._left_pane.setVisible(state["left"])
-        self._middle_pane.setVisible(state["middle"])
-        self._info_panel.setVisible(state["info"])
-        self._top_bar.setVisible(state["top"])
-        if state["menubar"] is not None:
-            self.menuBar().setVisible(state["menubar"])
-        self.statusBar().setVisible(state["statusbar"])
+        self._restore_chrome(state)
 
         self.showNormal()
         self.restoreGeometry(state["geometry"])
@@ -1136,6 +1185,165 @@ class MainWindow(QMainWindow):
         self.activateWindow()
         self.player.surface.setFocus(Qt.OtherFocusReason)
 
+    # ------------------------------------------------ picture-in-picture
+
+    def _video_double_clicked(self):
+        """In PiP a double-click means "give me the window back", not "now go
+        fullscreen" — which is what it means everywhere else."""
+        if self._pip_state:
+            self.exit_pip()
+        else:
+            self.toggle_fullscreen()
+
+    def toggle_pip(self):
+        if self._pip_state:
+            self.exit_pip()
+        else:
+            self.enter_pip()
+
+    def enter_pip(self):
+        """Shrink the window to a small player that floats over other apps.
+
+        Built the same way as fullscreen, in reverse, and for the same reason:
+        the video surface is never reparented, so libVLC keeps its drawable.
+        The one structural change is the stay-on-top flag — Qt restacks the
+        native window in place rather than recreating it, which was measured
+        before this was written (the handle and the picture both survive). The
+        re-attach below is insurance for platforms where that is not true.
+        """
+        if self._pip_state or not self.player.available:
+            return
+        if self._fs_state:
+            self.exit_fullscreen()
+
+        state = self._save_chrome()
+        state["flags"] = self.windowFlags()
+        state["handle"] = int(self.player.surface.winId())
+        self._pip_state = state
+
+        self._hide_chrome()
+        self.player.bar.set_advanced_visible(False)
+
+        rect = pip_rect(self._screen_area(), self._pip_width())
+        # The bar must come out of the layout *before* the window is resized:
+        # docked, its 522px minimum width is the window's minimum too, and the
+        # resize is silently clamped to it. Measured, not guessed.
+        self._float_bar(QRect(*rect), inset=0, gap=6, max_width=rect[2])
+        self._set_controls_visible(False)
+        self._relayout()
+
+        if self.isMaximized():
+            self.showNormal()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setGeometry(*rect)
+        self.show()
+        if int(self.player.surface.winId()) != state["handle"]:
+            self.player.reattach_surface()
+
+        self._reposition_pip_bar()
+        self.player.bar.set_pip(True)
+
+        self._pip_hold_ms = 0
+        self._fs_timer.start()
+        self.activateWindow()
+        self.raise_()
+        self.player.surface.setFocus(Qt.OtherFocusReason)
+
+    def exit_pip(self):
+        state = self._pip_state
+        if not state:
+            return
+        self._fs_timer.stop()
+        self._pip_state = None          # before _dock_bar, so the tick is inert
+        self.db.set_setting("pip_width", str(self.width()))
+
+        self._dock_bar()
+        self.player.set_chrome_visible(True)
+        self._restore_chrome(state)
+
+        self.setWindowFlags(state["flags"])
+        self.show()
+        self.restoreGeometry(state["geometry"])
+        if state["maximized"]:
+            self.showMaximized()
+        self._splitter.setSizes(state["sizes"])
+        self.player.bar.set_pip(False)
+        self.activateWindow()
+        self.raise_()
+        self.player.surface.setFocus(Qt.OtherFocusReason)
+
+    def _relayout(self):
+        """Recompute the window's minimum size *now*, not on the next tick.
+
+        A layout applies its minimum by calling setMinimumSize on the widget,
+        and only recomputes when a posted LayoutRequest is delivered. Hiding the
+        panes and detaching the bar therefore leaves the old, much larger
+        minimum in place for the rest of the current call — which silently
+        clamped the resize into PiP to the size the window had with the bar
+        still docked (996x441 instead of 560x315).
+        """
+        for widget in (self.player, self._splitter, self.centralWidget(), self):
+            if widget is None:
+                continue
+            layout = widget.layout()
+            if layout is not None:
+                layout.invalidate()
+            widget.updateGeometry()
+        # A QSplitter has no QLayout to invalidate — it recomputes when its
+        # posted LayoutRequest is delivered, so deliver those now. Only that
+        # event type, so no input or paint work happens here.
+        QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+        self.setMinimumSize(0, 0)
+        layout = self.layout()
+        if layout is not None:
+            layout.activate()
+
+    def _screen_area(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen is not None else self.geometry()
+        return (area.x(), area.y(), area.width(), area.height())
+
+    def _pip_width(self) -> int:
+        try:
+            return int(self.db.get_setting("pip_width", str(PIP_WIDTH)) or PIP_WIDTH)
+        except (TypeError, ValueError):
+            return PIP_WIDTH
+
+    def _pip_tick(self):
+        """Controls follow the pointer: up while it is over the mini player.
+
+        Deliberately not the fullscreen rule of "any mouse movement shows the
+        bar" — in PiP you are working in another application, and the bar
+        appearing every time the mouse twitched would be noise.
+        """
+        position = QCursor.pos()
+        over = self.frameGeometry().contains(position)
+        if not over and self._fs_overlay is not None:
+            over = self._fs_overlay.geometry().contains(position)
+        if self._pip_hold_ms > 0:
+            self._pip_hold_ms -= self._fs_timer.interval()
+            over = True
+        self._set_controls_visible(over)
+
+    def _reposition_pip_bar(self):
+        """Keep the floating bar under the mini window as it is moved/resized."""
+        if not self._pip_state or self._fs_overlay is None:
+            return
+        frame = self.frameGeometry()
+        overlay = self._fs_overlay
+        overlay.setFixedWidth(max(200, frame.width()))
+        overlay.adjustSize()
+        overlay.move(frame.x() + (frame.width() - overlay.width()) // 2,
+                     frame.y() + frame.height() - overlay.height() - 6)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._reposition_pip_bar()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reposition_pip_bar()
+
     def _fs_tick(self):
         """Hide the controls and pointer once the mouse goes still.
 
@@ -1143,6 +1351,9 @@ class MainWindow(QMainWindow):
         libVLC's own view sits on top of the surface and can swallow them, so
         an event-driven approach would leave the bar stuck hidden.
         """
+        if self._pip_state:
+            self._pip_tick()
+            return
         if not self._fs_state:
             return
         position = QCursor.pos()
@@ -1201,12 +1412,12 @@ class MainWindow(QMainWindow):
     def _arrows_go_to_player(self) -> bool:
         """Who owns the arrow keys right now.
 
-        Fullscreen has no channel list, so playback always wins there. Windowed,
-        the video takes them only while it holds focus - which it is given the
-        moment playback starts - leaving arrow channel-surfing intact whenever
-        the list is what you are actually looking at.
+        Fullscreen and Picture-in-Picture have no channel list, so playback
+        always wins there. Windowed, the video takes them only while it holds
+        focus - which it is given the moment playback starts - leaving arrow
+        channel-surfing intact whenever the list is what you are looking at.
         """
-        if self._fs_state:
+        if self._fs_state or self._pip_state:
             return True
         focused = QApplication.focusWidget()
         if focused is None:
@@ -1221,6 +1432,9 @@ class MainWindow(QMainWindow):
 
         if key == Qt.Key_Escape and self._fs_state:
             self.exit_fullscreen()
+            return True
+        if key == Qt.Key_Escape and self._pip_state:
+            self.exit_pip()
             return True
         # Dialogs (VLSub, Effects) keep their own keyboard entirely — but the
         # test is "does another window own the focus", not "is this window
@@ -1280,11 +1494,14 @@ class MainWindow(QMainWindow):
     def _key_feedback(self, message: str):
         """Say what the key did — otherwise there is no telling it worked.
 
-        Fullscreen hides the status bar, so the floating control bar is popped
-        back up instead: it already shows the position and volume the key just
-        changed, and fades out again on its own.
+        Fullscreen and PiP hide the status bar, so the floating control bar is
+        popped back up instead: it already shows the position and volume the key
+        just changed, and fades out again on its own.
         """
-        if self._fs_state:
+        if self._pip_state:
+            self._pip_hold_ms = 1600
+            self._set_controls_visible(True)
+        elif self._fs_state:
             self._fs_idle_ms = 0
             self._set_controls_visible(True)
             self._restore_cursor()
@@ -1678,6 +1895,8 @@ class MainWindow(QMainWindow):
             app.removeEventFilter(self)
         if self._fs_state:
             self.exit_fullscreen()
+        if self._pip_state:
+            self.exit_pip()
         if self._effects_dialog is not None:
             self._effects_dialog.close()
         ThreadedTask.drain()
