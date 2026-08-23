@@ -45,6 +45,12 @@
   </provides>
 
   <releases>
+    <release version="1.2.0" date="2026-08-23">
+      <description>
+        <p>Picture-in-Picture: shrink the window to a small player that stays
+        above other applications, with controls that appear on hover.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-08-23">
       <description>
         <p>VLC's keyboard controls: left and right arrows seek ten seconds, up

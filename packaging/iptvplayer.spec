@@ -18,7 +18,7 @@ from PyInstaller.utils.hooks import collect_submodules
 ROOT = Path(SPECPATH).parent
 APP_NAME = "IPTV Player"
 EXE_NAME = "IPTVPlayer"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform.startswith("win")

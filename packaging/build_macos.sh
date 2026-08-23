@@ -15,7 +15,7 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
 APP_NAME="IPTV Player"
-VERSION="1.1.0"
+VERSION="1.2.0"
 ARCH="$(uname -m)"
 APP="dist/${APP_NAME}.app"
 DMG="dist/IPTV-Player-${VERSION}-macOS-${ARCH}.dmg"
