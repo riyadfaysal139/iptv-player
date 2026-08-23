@@ -42,6 +42,19 @@ ADJUST_NEUTRAL = {
     "contrast": 1.0, "brightness": 1.0, "saturation": 1.0, "gamma": 1.0, "hue": 0,
 }
 
+# Keep a forward seek this far from the end. Landing exactly on the duration
+# trips end-of-media, so the arrow key would advance to the next item instead
+# of seeking - which looks like the key doing something entirely different.
+SEEK_TAIL_MS = 1000
+
+
+def clamp_seek(position_ms: int, delta_s: int, duration_ms: int) -> int:
+    """Where a relative jump should land, kept inside the media."""
+    target = int(position_ms) + int(delta_s) * 1000
+    if duration_ms and duration_ms > 0:
+        target = min(target, max(0, int(duration_ms) - SEEK_TAIL_MS))
+    return max(0, target)
+
 
 class VideoSurface(QFrame):
     """Native window libVLC renders into. Must stay opaque and un-styled."""
@@ -53,6 +66,10 @@ class VideoSurface(QFrame):
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WA_NativeWindow, True)
         self.setAutoFillBackground(True)
+        # Focusable so the arrow keys can be routed to playback rather than to
+        # the channel list. Without this the surface can never hold focus and
+        # the "arrows follow focus" rule would never fire.
+        self.setFocusPolicy(Qt.StrongFocus)
         palette = self.palette()
         palette.setColor(QPalette.Window, QColor("#000000"))
         self.setPalette(palette)
@@ -341,9 +358,30 @@ class PlayerWidget(QWidget):
             # re-stated here rather than only at engine creation.
             self._apply_engine_settings()
             self._poll.start()
+            self._claim_focus()
             self.playbackStarted.emit()
         except Exception as exc:
             self.errorOccurred.emit(f"Could not start playback: {exc}")
+
+    def _claim_focus(self):
+        """Hand keyboard focus to the video once something is actually playing.
+
+        This is what makes the arrow keys control playback straight after you
+        press play, instead of still scrolling the channel list. Skipped when a
+        text field holds focus, so a queued start cannot steal the caret from
+        someone mid-search.
+        """
+        from PySide6.QtWidgets import (
+            QAbstractSpinBox, QApplication, QComboBox, QLineEdit, QPlainTextEdit,
+            QTextEdit,
+        )
+
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit)):
+            return
+        if isinstance(focused, QComboBox) and focused.isEditable():
+            return
+        self.surface.setFocus(Qt.OtherFocusReason)
 
     def set_chrome_visible(self, visible: bool):
         """Show/hide the transport bar (used by fullscreen auto-hide)."""
@@ -414,15 +452,20 @@ class PlayerWidget(QWidget):
             except Exception:
                 pass
 
-    def seek_relative(self, seconds: int):
-        """VLC's arrow-key jumps."""
+    def seek_relative(self, seconds: int) -> bool:
+        """VLC's arrow-key jumps. False when the stream cannot be seeked."""
         if self.player is None or not self._seekable:
-            return
+            return False
         try:
-            target = max(0, self.player.get_time() + int(seconds) * 1000)
+            target = clamp_seek(self.player.get_time(), seconds,
+                                self.player.get_length())
             self.player.set_time(int(target))
         except Exception:
-            pass
+            return False
+        # Repaint now rather than waiting up to 500 ms for the next tick, or
+        # the bar lags visibly behind the keypress.
+        self.refresh_now()
+        return True
 
     def refresh_now(self):
         self._tick()

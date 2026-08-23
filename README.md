@@ -206,8 +206,40 @@ ratio/crop/deinterlace, and the audio and subtitle track menus — and hides fro
 **View ▸ Advanced controls**, as in VLC.
 
 Controls a live stream cannot honour (seek, frame-step, A↔B, speed) grey out on
-live channels. Keyboard: `Space` play/pause, `F` fullscreen, `M` mute, `[` `]`
-speed down/up, `=` normal speed, `Ctrl+L` browser, `Esc` leave fullscreen.
+live channels.
+
+### Keyboard
+
+| Key | Action |
+|---|---|
+| `Space` | Play / pause |
+| `←` `→` | Seek −10 s / +10 s |
+| `↑` `↓` | Volume −5 / +5 |
+| `M` | Mute |
+| `[` `]` | Speed down / up · `=` normal speed |
+| `F` | Fullscreen · `Esc` leaves it |
+| `Ctrl+L` | Show or hide the browser |
+
+`Space`, `M` and the speed keys work wherever you are in the app — they are
+filtered before the channel list can swallow them, which is what makes them
+reliable.
+
+**The arrow keys are shared**, because they are also how you move through the
+channel list. Whoever has focus gets them:
+
+- **The video has focus** — arrows seek and change volume. Playing something
+  hands focus to the video, so they work straight after you press play, and
+  clicking the video gets them back.
+- **The list has focus** — arrows move through channels, as before. Click the
+  list to browse.
+- **Fullscreen** — always the player, since there is no list to compete.
+- **Typing in a search box** — always the box. `Space` inserts a space and the
+  arrows move the caret; the player does not interfere.
+
+The status bar says which happened (`Seek +10s`, `Volume 80%`), so there is no
+guessing about where focus is. In fullscreen the status bar is hidden, so a
+keypress pops the floating control bar up instead — it shows the new position
+and volume, then fades out again.
 
 **Adjustments and Effects** (the ⚙ button) is VLC's panel: a 10-band equaliser
 with all 18 of VLC's presets and a preamp, and video adjustment for contrast,

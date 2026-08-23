@@ -6,13 +6,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QCursor, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QCursor, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
-    QListView, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
-    QSplitter, QStackedWidget, QTabBar, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractSpinBox, QApplication, QComboBox, QDialog, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStackedWidget,
+    QTabBar, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from core import sync as sync_mod
@@ -35,6 +35,8 @@ EXPIRY_WARN_DAYS = 7
 EPG_CACHE_SECONDS = 300        # now/next only moves every half hour
 RESOLVED_TTL_SECONDS = 45      # CDN tokens verified good at 25 s; stay well inside
 PREFETCH_DELAY_MS = 180        # let arrow-key scrolling settle before resolving
+SEEK_STEP_SECONDS = 10         # VLC's short jump, on the left/right arrows
+VOLUME_STEP = 5                # matches the wheel step over the volume slider
 
 
 class SyncWorker(QObject):
@@ -207,9 +209,9 @@ class MainWindow(QMainWindow):
         self._fs_timer.setInterval(400)
         self._fs_timer.timeout.connect(self._fs_tick)
 
-        # Esc must work even when focus sits in a list or search box.
-        escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
-        escape.activated.connect(lambda: self._fs_state and self.exit_fullscreen())
+        # Player keys are filtered at the application level so a focused list,
+        # tree or search box cannot swallow them first. See eventFilter().
+        QApplication.instance().installEventFilter(self)
 
     # ------------------------------------------------------------------ ui
 
@@ -1043,6 +1045,12 @@ class MainWindow(QMainWindow):
         self.statusBar().setVisible(False)
         self.showFullScreen()
         self._float_bar()
+        # The overlay is a separate top-level and takes activation with it, so
+        # claim it back and put focus on the video — otherwise nothing holds
+        # focus at all and the keyboard has no obvious owner.
+        self.activateWindow()
+        self.raise_()
+        self.player.surface.setFocus(Qt.OtherFocusReason)
 
         self._fs_idle_ms = 0
         self._fs_last_cursor = QCursor.pos()
@@ -1125,6 +1133,8 @@ class MainWindow(QMainWindow):
             self.showMaximized()
         self._splitter.setSizes(state["sizes"])
         self._fs_state = None
+        self.activateWindow()
+        self.player.surface.setFocus(Qt.OtherFocusReason)
 
     def _fs_tick(self):
         """Hide the controls and pointer once the mouse goes still.
@@ -1162,35 +1172,124 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
             self._cursor_hidden = False
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape and self._fs_state:
-            self.exit_fullscreen()
-            return
-        if not self.player.available:
-            super().keyPressEvent(event)
-            return
-        # VLC's own speed and mute keys. Arrow keys are deliberately left to
-        # the channel list, which is what they are for in this app.
+    # ------------------------------------------------------------- keyboard
+
+    def eventFilter(self, obj, event):
+        """VLC's keys, applied before a focused list can swallow them.
+
+        `keyPressEvent` on the window is not enough: it only runs once no child
+        has consumed the event, and QListView, QTreeWidget and QLineEdit all
+        consume Space. Filtering at the application level is what makes the
+        shortcuts work no matter where focus happens to be.
+        """
+        if event.type() == QEvent.KeyPress and self._handle_player_key(event):
+            return True
+        return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _is_typing() -> bool:
+        """True when a text field has focus, in which case typing wins.
+
+        Space has to insert a space in the search box, and the arrows have to
+        move the caret, so the player must keep its hands off entirely.
+        """
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QAbstractSpinBox, QTextEdit, QPlainTextEdit)):
+            return True
+        return isinstance(focused, QComboBox) and focused.isEditable()
+
+    def _arrows_go_to_player(self) -> bool:
+        """Who owns the arrow keys right now.
+
+        Fullscreen has no channel list, so playback always wins there. Windowed,
+        the video takes them only while it holds focus - which it is given the
+        moment playback starts - leaving arrow channel-surfing intact whenever
+        the list is what you are actually looking at.
+        """
+        if self._fs_state:
+            return True
+        focused = QApplication.focusWidget()
+        if focused is None:
+            return False
+        return focused is self.player.surface or self.player.isAncestorOf(focused)
+
+    def _handle_player_key(self, event) -> bool:
+        """Returns True when the key was consumed as a player command."""
+        if event.isAutoRepeat() and event.key() in (Qt.Key_Space, Qt.Key_M):
+            return False
         key = event.key()
+
+        if key == Qt.Key_Escape and self._fs_state:
+            self.exit_fullscreen()
+            return True
+        # Dialogs (VLSub, Effects) keep their own keyboard entirely — but the
+        # test is "does another window own the focus", not "is this window
+        # active". Going fullscreen leaves focusWidget() None and the window
+        # reporting inactive, because the floating control bar is a separate
+        # top-level; an activeWindow() test silently swallowed every key there.
+        focused = QApplication.focusWidget()
+        if focused is not None:
+            owner = focused.window()
+            if owner is not self and owner is not self._fs_overlay:
+                return False
+        elif QApplication.activeModalWidget() is not None:
+            return False
+        if not self.player.available or self._is_typing():
+            return False
+
         if key == Qt.Key_Space:
             self.player.toggle_pause()
-            return
-        if key in (Qt.Key_BracketRight, Qt.Key_BracketLeft, Qt.Key_Equal):
-            rates = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0]
-            if key == Qt.Key_Equal:
-                rate = 1.0
-            else:
-                current = min(range(len(rates)),
-                              key=lambda i: abs(rates[i] - self.player.rate()))
-                step = 1 if key == Qt.Key_BracketRight else -1
-                rate = rates[max(0, min(len(rates) - 1, current + step))]
-            self.player.bar.apply_rate(rate)
-            self.statusBar().showMessage(f"Speed {rate:.2f}x", 2000)
-            return
+            self._key_feedback("Pause" if not self.player.is_playing() else "Play")
+            return True
         if key == Qt.Key_M:
-            self.player.bar.toggle_mute()
-            return
-        super().keyPressEvent(event)
+            muted = self.player.bar.toggle_mute()
+            self._key_feedback("Muted" if muted else "Unmuted")
+            return True
+        if key in (Qt.Key_BracketRight, Qt.Key_BracketLeft, Qt.Key_Equal):
+            self._step_rate(key)
+            return True
+
+        if key in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            if not self._arrows_go_to_player():
+                return False
+            if key in (Qt.Key_Left, Qt.Key_Right):
+                step = SEEK_STEP_SECONDS if key == Qt.Key_Right else -SEEK_STEP_SECONDS
+                if self.player.seek_relative(step):
+                    self._key_feedback(f"Seek {step:+d}s")
+                else:
+                    self._key_feedback("Live stream — cannot seek")
+            else:
+                step = VOLUME_STEP if key == Qt.Key_Up else -VOLUME_STEP
+                self._key_feedback(f"Volume {self.player.bar.nudge_volume(step)}%")
+                self.db.set_setting("volume", str(self.player.bar.volume.value()))
+            return True
+        return False
+
+    def _step_rate(self, key):
+        rates = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0]
+        if key == Qt.Key_Equal:
+            rate = 1.0
+        else:
+            current = min(range(len(rates)),
+                          key=lambda i: abs(rates[i] - self.player.rate()))
+            step = 1 if key == Qt.Key_BracketRight else -1
+            rate = rates[max(0, min(len(rates) - 1, current + step))]
+        self.player.bar.apply_rate(rate)
+        self._key_feedback(f"Speed {rate:.2f}x")
+
+    def _key_feedback(self, message: str):
+        """Say what the key did — otherwise there is no telling it worked.
+
+        Fullscreen hides the status bar, so the floating control bar is popped
+        back up instead: it already shows the position and volume the key just
+        changed, and fades out again on its own.
+        """
+        if self._fs_state:
+            self._fs_idle_ms = 0
+            self._set_controls_visible(True)
+            self._restore_cursor()
+        else:
+            self.statusBar().showMessage(message, 1500)
 
     # -------------------------------------------------------------- series
 
@@ -1574,6 +1673,9 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         # Order matters: stop background producers before the objects they
         # signal into are destroyed.
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         if self._fs_state:
             self.exit_fullscreen()
         if self._effects_dialog is not None:

@@ -399,6 +399,48 @@ class TestVLSub(unittest.TestCase):
                         "the keyless backend must always report itself usable")
 
 
+class TestSeekClamp(unittest.TestCase):
+    """Where the arrow keys land.
+
+    Kept as a pure function in ui/player_widget.py so it can be tested without
+    Qt or libVLC. Importing the module is safe: it only pulls in PySide6 types
+    at class-definition time, not a running application.
+    """
+
+    def setUp(self):
+        from ui.player_widget import SEEK_TAIL_MS, clamp_seek
+
+        self.clamp = clamp_seek
+        self.tail = SEEK_TAIL_MS
+
+    def test_ordinary_jump_is_exact(self):
+        self.assertEqual(self.clamp(60_000, 10, 600_000), 70_000)
+        self.assertEqual(self.clamp(60_000, -10, 600_000), 50_000)
+
+    def test_backwards_past_the_start_stops_at_zero(self):
+        self.assertEqual(self.clamp(3_000, -10, 600_000), 0)
+        self.assertEqual(self.clamp(0, -10, 600_000), 0)
+
+    def test_forwards_past_the_end_keeps_headroom(self):
+        """Landing on the duration ends the media, so the arrow would look
+        like it skipped to the next item instead of seeking."""
+        duration = 600_000
+        landed = self.clamp(duration - 2_000, 10, duration)
+        self.assertLess(landed, duration)
+        self.assertEqual(landed, duration - self.tail)
+        # Repeated presses at the end stay put rather than running away.
+        self.assertEqual(self.clamp(landed, 10, duration), duration - self.tail)
+
+    def test_unknown_duration_is_not_clamped_but_never_negative(self):
+        """Live streams report length 0; the value must stay sane anyway."""
+        self.assertEqual(self.clamp(30_000, 10, 0), 40_000)
+        self.assertEqual(self.clamp(5_000, -10, 0), 0)
+        self.assertEqual(self.clamp(0, -10, -1), 0)
+
+    def test_short_media_cannot_produce_a_negative_target(self):
+        self.assertEqual(self.clamp(200, 10, 500), 0)
+
+
 class TestSubtitleHash(unittest.TestCase):
     """The remote hash is the whole basis of VLSub's exact match.
 

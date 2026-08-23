@@ -395,6 +395,17 @@ class TransportBar(QWidget):
         self.btn_mute.set_on(muted)
         self.btn_mute.setToolTip("Unmute" if muted else "Mute")
 
+    def nudge_volume(self, delta: int) -> int:
+        """Step the volume and return the new level.
+
+        Goes through the slider rather than the player so the control, the
+        engine and the mute state all stay in step - `_volume_changed` already
+        un-mutes on the way up.
+        """
+        value = max(0, min(self.volume.maximum(), self.volume.value() + int(delta)))
+        self.volume.setValue(value)
+        return value
+
     def _volume_changed(self, value: int):
         self.player.set_volume(value)
         if self.player.is_muted() and value > 0:
