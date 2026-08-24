@@ -187,6 +187,44 @@ QLabel#playerOverlay {
     font-size: 14px;
     padding: 24px;
 }
+/* the card an episode ending leaves behind ------------------------------- */
+QFrame#upNext {
+    background-color: #05081a;
+    border: none;
+}
+QLabel#upNextHeading {
+    color: #7b84b4;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+QLabel#upNextStill {
+    background-color: #0b1030;
+    border: 1px solid #3a4166;
+    border-radius: 7px;
+}
+/* Explicitly transparent: without it these inherit the global control
+   background and paint bands across the card. */
+QLabel#upNextHeading,
+QLabel#upNextTitle,
+QLabel#upNextSubtitle,
+QLabel#upNextHint { background: transparent; border: none; }
+QLabel#upNextTitle  { color: #ffffff; font-size: 18px; font-weight: 600; }
+QLabel#upNextSubtitle { color: #9aa3cd; font-size: 14px; }
+QLabel#upNextHint   { color: #7b84b4; font-size: 13px; }
+QPushButton#upNextPlay {
+    background-color: #f5d90a; color: #06091c;
+    border: none; border-radius: 6px;
+    padding: 10px 26px; font-size: 14px; font-weight: 700;
+}
+QPushButton#upNextPlay:hover { background-color: #ffe533; }
+QPushButton#upNextCancel {
+    background-color: rgba(255, 255, 255, 0.08);
+    border: 1px solid #3a4166; border-radius: 6px;
+    padding: 10px 20px; color: #ffffff; font-size: 14px;
+}
+QPushButton#upNextCancel:hover { border-color: #6b74a8; }
+
 QLabel#liveBadge {
     background-color: #d81f2a;
     color: #ffffff;

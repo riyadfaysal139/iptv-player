@@ -86,6 +86,45 @@ def describe_resume(episode, resume_secs: int) -> str:
     return f"Play {label}"
 
 
+def episode_caption(episode, show: str = ""):
+    """Two lines naming an episode: (what it is, what show it is from).
+
+    Provider episode titles are inconsistent. Some are a real name; many just
+    repeat the show and the season/episode label straight back at you, which on
+    a card reads as "S01E02 · Trailer Park Boys - S01E02". The label is always
+    shown; the provider's name only earns its place when it says something the
+    label does not.
+    """
+    label = f"S{episode.get('season', 0):02d}E{episode.get('episode', 0):02d}"
+    name = (episode.get("title") or "").strip()
+    for junk in (show or "", label):
+        if junk:
+            name = name.replace(junk, "").replace(junk.lower(), "")
+    # Whatever punctuation the provider used to join them is now dangling.
+    name = name.strip(" -–—·:|,")
+    if not name or name.lower() == label.lower():
+        return label, show
+    return f"{label} · {name}", show
+
+
+def next_episode(episodes, current_id):
+    """The episode after `current_id`, or None at the end of the show.
+
+    Deliberately does *not* wrap, unlike the ⏭ button: the show running out is
+    the whole point of the end-of-show card, and a countdown that silently
+    looped back to episode one would be worse than no countdown at all. Season
+    boundaries need no special case — the list is already season/episode
+    ordered, so the next entry is the next episode.
+    """
+    if not episodes:
+        return None
+    for index, episode in enumerate(episodes):
+        if str(episode.get("episode_id")) != str(current_id):
+            continue
+        return episodes[index + 1] if index + 1 < len(episodes) else None
+    return None                     # not in this show's list: offer nothing
+
+
 # --------------------------------------------------------------------------
 # a wrapping layout, which Qt does not ship
 # --------------------------------------------------------------------------

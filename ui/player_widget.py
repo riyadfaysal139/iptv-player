@@ -25,7 +25,8 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
-    QFrame, QLabel, QSizePolicy, QStackedLayout, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QStackedLayout,
+    QVBoxLayout, QWidget,
 )
 
 from core import vlc_setup
@@ -46,6 +47,9 @@ ADJUST_NEUTRAL = {
 # trips end-of-media, so the arrow key would advance to the next item instead
 # of seeking - which looks like the key doing something entirely different.
 SEEK_TAIL_MS = 1000
+
+# The up-next card's thumbnail, 16:9 at a size that survives the PiP window.
+UP_NEXT_STILL = (280, 158)
 
 
 def clamp_seek(position_ms: int, delta_s: int, duration_ms: int) -> int:
@@ -90,6 +94,98 @@ class VideoSurface(QFrame):
         super().mouseDoubleClickEvent(event)
 
 
+class UpNextPanel(QFrame):
+    """What an episode ending leaves on screen: the next one, or the end.
+
+    Deliberately knows nothing about the catalog — it is handed a heading, a
+    title, a still and a countdown. It shares the player's stacked layout with
+    the video surface, which is hidden while this shows: Qt cannot paint over
+    libVLC's native view, and this does not try to. By the time it appears the
+    media has been stopped, so there is nothing to paint over.
+    """
+
+    playRequested = Signal()
+    cancelled = Signal()      # the second button: Cancel, or Back to the show
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("upNext")
+        self.setCursor(Qt.PointingHandCursor)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(36, 28, 36, 28)
+        root.setSpacing(0)
+        root.addStretch(1)
+
+        self.heading = QLabel("")
+        self.heading.setObjectName("upNextHeading")
+        root.addWidget(self.heading, 0, Qt.AlignHCenter)
+        root.addSpacing(14)
+
+        self.still = QLabel()
+        self.still.setObjectName("upNextStill")
+        self.still.setFixedSize(UP_NEXT_STILL[0], UP_NEXT_STILL[1])
+        self.still.setAlignment(Qt.AlignCenter)
+        self.still.setScaledContents(False)
+        root.addWidget(self.still, 0, Qt.AlignHCenter)
+        root.addSpacing(14)
+
+        self.title = QLabel("")
+        self.title.setObjectName("upNextTitle")
+        self.title.setAlignment(Qt.AlignCenter)
+        self.title.setWordWrap(True)
+        root.addWidget(self.title)
+
+        self.subtitle = QLabel("")
+        self.subtitle.setObjectName("upNextSubtitle")
+        self.subtitle.setAlignment(Qt.AlignCenter)
+        self.subtitle.setWordWrap(True)
+        root.addWidget(self.subtitle)
+        root.addSpacing(18)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(10)
+        buttons.addStretch(1)
+        self.play_button = QPushButton("Play")
+        self.play_button.setObjectName("upNextPlay")
+        self.play_button.setCursor(Qt.PointingHandCursor)
+        self.play_button.clicked.connect(self.playRequested)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setObjectName("upNextCancel")
+        self.cancel_button.setCursor(Qt.PointingHandCursor)
+        self.cancel_button.clicked.connect(self.cancelled)
+        buttons.addWidget(self.play_button)
+        buttons.addWidget(self.cancel_button)
+        buttons.addStretch(1)
+        root.addLayout(buttons)
+
+        root.addSpacing(10)
+        self.hint = QLabel("")
+        self.hint.setObjectName("upNextHint")
+        self.hint.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.hint)
+        root.addStretch(1)
+
+    def set_still(self, pixmap):
+        """The episode's thumbnail. Hidden outright when there is none — an
+        empty bordered rectangle reads as a picture that failed to load."""
+        if pixmap is None or pixmap.isNull():
+            self.still.clear()
+            self.still.hide()
+            return
+        self.still.show()
+        self.still.setPixmap(pixmap.scaled(
+            self.still.width(), self.still.height(),
+            Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+
+    def mouseReleaseEvent(self, event):
+        # The whole card is a target, which is the third of the four ways in
+        # (the others being Space, the play button, and the countdown).
+        if event.button() == Qt.LeftButton and self.play_button.isVisible():
+            self.playRequested.emit()
+        super().mouseReleaseEvent(event)
+
+
 class PlayerWidget(QWidget):
     """Video surface + VLC's transport controls."""
 
@@ -101,6 +197,8 @@ class PlayerWidget(QWidget):
     playbackStopped = Signal()
     fullscreenToggled = Signal()
     videoDoubleClicked = Signal()
+    upNextRequested = Signal()      # play what the card is offering
+    upNextDismissed = Signal()      # the end-of-show card's way out
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,6 +233,12 @@ class PlayerWidget(QWidget):
         self._poll.setInterval(500)
         self._poll.timeout.connect(self._tick)
 
+        self._countdown = QTimer(self)
+        self._countdown.setInterval(1000)
+        self._countdown.timeout.connect(self._countdown_tick)
+        self._countdown_left = 0
+        self._up_next_mode = "next"
+
         self._build_ui()
 
         if self._available:
@@ -166,6 +270,12 @@ class PlayerWidget(QWidget):
         self.overlay.setWordWrap(True)
         self.overlay.hide()
 
+        self.up_next = UpNextPanel()
+        self.up_next.hide()
+        self.up_next.playRequested.connect(self._up_next_play)
+        self.up_next.cancelled.connect(self._secondary_pressed)
+
+        self._stack.addWidget(self.up_next)
         self._stack.addWidget(self.overlay)
         self._stack.addWidget(self.surface)
         root.addWidget(container, 1)
@@ -336,6 +446,8 @@ class PlayerWidget(QWidget):
         if not self._available:
             self.errorOccurred.emit(vlc_setup.error_message() or "VLC not available")
             return
+        # Whatever the card was offering, something is starting now.
+        self.hide_up_next()
         now = time.monotonic() * 1000.0
         looks_like_repeat = (now - self._last_request_ms) < REPEAT_WINDOW_MS
         self._last_request_ms = now
@@ -405,6 +517,99 @@ class PlayerWidget(QWidget):
             return
         self.surface.setFocus(Qt.OtherFocusReason)
 
+    # ----------------------------------------------------------- up next
+
+    @property
+    def up_next_showing(self) -> bool:
+        return self.up_next.isVisible()
+
+    def show_up_next(self, title: str, subtitle: str, pixmap, seconds: int = 0):
+        """Offer the next episode in the video area.
+
+        The surface is hidden rather than merely covered: Qt cannot paint over
+        libVLC's native view, and the caller has already stopped the media, so
+        there is nothing left to show there anyway.
+        """
+        self.up_next.heading.setText("NEXT EPISODE")
+        self.up_next.title.setText(title)
+        self.up_next.subtitle.setText(subtitle)
+        self.up_next.set_still(pixmap)
+        self.up_next.play_button.setText("Play")
+        self.up_next.play_button.show()
+        self.up_next.cancel_button.setVisible(seconds > 0)
+        self.up_next.cancel_button.setText("Cancel")
+        self._up_next_mode = "next"
+        self._reveal_up_next()
+        if seconds > 0:
+            self._countdown_left = int(seconds)
+            self._show_countdown()
+            self._countdown.start()
+        else:
+            self.up_next.hint.setText("Space, the play button, or click the card")
+
+    def show_finished(self, show: str, pixmap=None):
+        """The end of the show: nothing to offer, so say so and get out."""
+        self.up_next.heading.setText("YOU'VE FINISHED")
+        self.up_next.title.setText(show)
+        self.up_next.subtitle.setText("")
+        self.up_next.set_still(pixmap)
+        self.up_next.play_button.hide()          # nothing to play
+        self.up_next.cancel_button.show()
+        self.up_next.cancel_button.setText("← Back to the show")
+        self.up_next.hint.setText("")
+        self._up_next_mode = "finished"
+        self._reveal_up_next()
+
+    def _reveal_up_next(self):
+        self._countdown.stop()
+        self.overlay.hide()
+        self.surface.hide()
+        self.up_next.show()
+        self._stack.setCurrentWidget(self.up_next)
+
+    def hide_up_next(self):
+        """Put the video area back. Safe to call when no card is showing."""
+        self._countdown.stop()
+        if not self.up_next.isVisible():
+            return
+        self.up_next.hide()
+        self.surface.show()
+        self._stack.setCurrentWidget(self.surface)
+
+    def _secondary_pressed(self):
+        """The card's second button, which means different things per card.
+
+        On the up-next card it stops the countdown and leaves the offer up; on
+        the end-of-show card it is the only button and means "done". Decided
+        from the mode rather than by rewiring the signal, so there is no state
+        to leave behind when one card replaces the other.
+        """
+        if self._up_next_mode == "finished":
+            self.upNextDismissed.emit()
+            return
+        self._countdown.stop()
+        self.up_next.cancel_button.hide()
+        self.up_next.hint.setText("Space, the play button, or click the card")
+
+    def cancel_countdown(self):
+        """Stop the clock but leave the offer standing (the Cancel button)."""
+        self._secondary_pressed()
+
+    def _show_countdown(self):
+        self.up_next.hint.setText(f"Playing in {self._countdown_left}…")
+
+    def _countdown_tick(self):
+        self._countdown_left -= 1
+        if self._countdown_left > 0:
+            self._show_countdown()
+            return
+        self._countdown.stop()
+        self.upNextRequested.emit()
+
+    def _up_next_play(self):
+        self._countdown.stop()
+        self.upNextRequested.emit()
+
     def set_chrome_visible(self, visible: bool):
         """Show/hide the transport bar (used by fullscreen auto-hide)."""
         if self.controls.isVisible() != visible:
@@ -429,6 +634,9 @@ class PlayerWidget(QWidget):
         self._pending = None
         self._switch_timer.stop()
         self._poll.stop()
+        # ⏹ while the card is up means "no thanks". The end-of-episode path
+        # stops first and shows the card after, so this is a no-op there.
+        self.hide_up_next()
         if self.player is not None:
             try:
                 self.player.stop()
@@ -442,6 +650,11 @@ class PlayerWidget(QWidget):
         self.playbackStopped.emit()
 
     def toggle_pause(self):
+        # Space and the bar's play button both arrive here, so the card only
+        # has to be caught once for both of them.
+        if self.up_next_showing:
+            self._up_next_play()
+            return
         if self.player is None or not self._current_url:
             return
         self.player.pause()

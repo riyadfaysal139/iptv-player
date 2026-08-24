@@ -606,6 +606,102 @@ class TestResumePick(unittest.TestCase):
         self.assertEqual(self.describe(self.episodes[0], 5), "Play S01E01")
 
 
+class TestNextEpisode(unittest.TestCase):
+    """What the up-next card offers when an episode ends.
+
+    Separate from the ⏭ button on purpose: this one stops at the end of the
+    show, because that is the case the "you've finished" card exists for.
+    """
+
+    def setUp(self):
+        from ui.series_page import next_episode
+
+        self.next = next_episode
+        self.episodes = [
+            {"episode_id": f"s{season}e{num}", "season": season, "episode": num}
+            for season in (1, 2) for num in (1, 2, 3)
+        ]
+
+    def test_the_next_one_in_the_season(self):
+        self.assertEqual(self.next(self.episodes, "s1e1")["episode_id"], "s1e2")
+
+    def test_the_last_of_a_season_crosses_into_the_next(self):
+        self.assertEqual(self.next(self.episodes, "s1e3")["episode_id"], "s2e1")
+
+    def test_the_last_episode_of_the_show_offers_nothing(self):
+        self.assertIsNone(self.next(self.episodes, "s2e3"))
+
+    def test_it_never_wraps_back_to_the_beginning(self):
+        """The difference from ⏭, and the reason the finished card exists."""
+        self.assertIsNone(self.next(self.episodes, "s2e3"))
+
+    def test_an_episode_from_another_show_offers_nothing(self):
+        """Better nothing than autoplaying into a show you are not watching."""
+        self.assertIsNone(self.next(self.episodes, "gone"))
+
+    def test_no_episodes_offers_nothing(self):
+        self.assertIsNone(self.next([], "s1e1"))
+        self.assertIsNone(self.next(None, "s1e1"))
+
+    def test_ids_are_compared_as_strings(self):
+        """Providers send episode ids as both ints and strings."""
+        episodes = [{"episode_id": 11}, {"episode_id": 12}]
+        self.assertEqual(self.next(episodes, "11")["episode_id"], 12)
+        self.assertEqual(self.next(episodes, 11)["episode_id"], 12)
+
+    def test_a_single_episode_show_offers_nothing(self):
+        self.assertIsNone(self.next([{"episode_id": "only"}], "only"))
+
+
+class TestEpisodeCaption(unittest.TestCase):
+    """Naming an episode on the up-next card.
+
+    Provider titles are a mess: some carry a real episode name, many just echo
+    the show and the SxxEyy label, which reads as "S01E02 · Show - S01E02" if
+    you paste them together without looking.
+    """
+
+    def setUp(self):
+        from ui.series_page import episode_caption
+
+        self.caption = episode_caption
+
+    def episode(self, title, season=1, num=2):
+        return {"season": season, "episode": num, "title": title}
+
+    def test_a_real_name_is_worth_showing(self):
+        title, subtitle = self.caption(self.episode("Mrs. Peterson"), "Trailer Park Boys")
+        self.assertEqual(title, "S01E02 · Mrs. Peterson")
+        self.assertEqual(subtitle, "Trailer Park Boys")
+
+    def test_a_title_that_only_repeats_the_show_is_dropped(self):
+        """The real case on this catalog: 'Trailer Park Boys - S01E02'."""
+        title, subtitle = self.caption(
+            self.episode("Trailer Park Boys - S01E02"), "Trailer Park Boys")
+        self.assertEqual(title, "S01E02")
+        self.assertEqual(subtitle, "Trailer Park Boys")
+
+    def test_a_title_that_is_only_the_label_is_dropped(self):
+        self.assertEqual(self.caption(self.episode("S01E02"), "Show")[0], "S01E02")
+
+    def test_an_empty_title_still_names_the_episode(self):
+        self.assertEqual(self.caption(self.episode(""), "Show")[0], "S01E02")
+        self.assertEqual(self.caption(self.episode(None), "Show")[0], "S01E02")
+
+    def test_no_show_name_is_not_an_error(self):
+        title, subtitle = self.caption(self.episode("Mrs. Peterson"))
+        self.assertEqual(title, "S01E02 · Mrs. Peterson")
+        self.assertEqual(subtitle, "")
+
+    def test_dangling_punctuation_is_cleaned_up(self):
+        for raw in ("Show — S01E02", "Show: S01E02", "Show | S01E02", "S01E02 - Show"):
+            self.assertEqual(self.caption(self.episode(raw), "Show")[0], "S01E02", raw)
+
+    def test_the_label_is_zero_padded_two_digits(self):
+        title, _ = self.caption(self.episode("Name", season=12, num=7), "")
+        self.assertTrue(title.startswith("S12E07"), title)
+
+
 class TestMasterSearch(unittest.TestCase):
     """Searching the whole catalog at once, not just the open tab."""
 

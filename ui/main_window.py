@@ -37,7 +37,7 @@ from ui.models import (
 from ui.player_widget import PlayerWidget
 from ui.playlist_dialog import PlaylistEditor, PlaylistManager
 from ui.search_page import SearchPage, search_catalog
-from ui.series_page import SeriesPage
+from ui.series_page import SeriesPage, episode_caption, next_episode
 from ui.subtitle_dialog import SubtitleDialog
 
 TABS = [("live", "TV"), ("movie", "MOVIES"), ("series", "SERIES")]
@@ -56,6 +56,7 @@ PLAYER_PANE_WIDTH = 540
 MIN_MIDDLE_WIDTH = 260         # a poster column plus its scrollbar
 MIN_LEFT_WIDTH = 180           # enough for a category name
 PLAYER_HIDE_DELAY_MS = 400     # past SWITCH_DEBOUNCE_MS, so a queued switch wins
+UP_NEXT_SECONDS = 10           # Netflix's countdown, near enough
 
 
 def pip_rect(screen, width: int = PIP_WIDTH, margin: int = PIP_MARGIN):
@@ -237,6 +238,14 @@ class MainWindow(QMainWindow):
         self._pip_state = None
         self._pip_hold_ms = 0
         self._current_episode = None
+        # The episode list the current episode was played from, captured at
+        # play time: the series page may since have been pointed at another
+        # show, and next/previous must follow what is playing, not what is
+        # being browsed.
+        self._episode_queue = []
+        self._playing_series = None      # the show the current episode is from
+        self._up_next = None
+        self._up_next_url = ""
 
         self.downloads = DownloadManager(db)
         self.downloads.start()
@@ -255,6 +264,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
 
         self.images.loaded.connect(lambda _: self.list_view.viewport().update())
+        self.images.loaded.connect(self._up_next_image)
 
         if self.playlist is None:
             QTimer.singleShot(200, self.first_run)
@@ -405,6 +415,8 @@ class MainWindow(QMainWindow):
         self.player.positionChanged.connect(self._remember_position)
         self.player.fullscreenToggled.connect(self.toggle_fullscreen)
         self.player.videoDoubleClicked.connect(self._video_double_clicked)
+        self.player.upNextRequested.connect(self._play_up_next)
+        self.player.upNextDismissed.connect(self._dismiss_up_next)
         self._connect_transport(self.player.bar)
         right_layout.addWidget(self.player, 3)
 
@@ -580,6 +592,16 @@ class MainWindow(QMainWindow):
         )
         self.dl_action.toggled.connect(self.downloads.set_allow_while_playing)
         settings_menu.addAction(self.dl_action)
+
+        self.autoplay_action = QAction("Autoplay next episode", self, checkable=True)
+        self.autoplay_action.setChecked(self.db.get_bool("autoplay_next", True))
+        self.autoplay_action.setToolTip(
+            "When an episode ends, count down and play the next one. Off, the "
+            "card still appears — it just waits for you."
+        )
+        self.autoplay_action.toggled.connect(
+            lambda on: self.db.set_setting("autoplay_next", "1" if on else "0"))
+        settings_menu.addAction(self.autoplay_action)
 
         self.autosync_action = QAction("Update catalog daily", self, checkable=True)
         self.autosync_action.setChecked(True)
@@ -978,6 +1000,7 @@ class MainWindow(QMainWindow):
         self.set_player_visible(True)
         self._current_item = row
         self._current_episode = None
+        self._playing_series = None
         client = self.client()
         stream_id, name, _, _, ext = row[0], row[1], row[2], row[3], row[4]
         is_live = self.kind == "live"
@@ -1014,6 +1037,7 @@ class MainWindow(QMainWindow):
         self.set_player_visible(True)
         self._current_item = None
         self._current_episode = None
+        self._playing_series = None
         self.now_title.setText(title)
         self.live_badge.hide()
         self.player.play(Path(path).absolute().as_uri(), title, is_live=False)
@@ -1032,8 +1056,62 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.replay_current)
         elif bar.loop_mode == "all" or bar.shuffle:
             QTimer.singleShot(0, lambda: self.step_item(1))
+        elif self._current_episode is not None:
+            QTimer.singleShot(0, self._episode_ended)
         else:
             self.player.stop()
+
+    def _episode_ended(self):
+        """Offer the next episode instead of just stopping.
+
+        Order matters twice over. The player is stopped first, because the
+        account allows one connection and the finished stream should not hold
+        it while a card sits on screen; and the idle timer is stopped *after*,
+        because stop() is what emits playbackStopped and starts it.
+        """
+        episode = self._current_episode
+        following = next_episode(self._episode_queue, episode["episode_id"])
+        # The show being *watched*, which is not necessarily the one on screen.
+        series = self._playing_series
+        show = series[1] if series else ""
+        episode_series = series[0] if series else ""
+
+        self.player.stop()
+        self._idle_timer.stop()         # the pane stays: there is something to see
+
+        if following is None:
+            # The show's own cover, which is also what the episode cards fall
+            # back to — the provider ships no per-episode stills.
+            self._up_next_url = self._series_info(episode_series).get("cover") or ""
+            self.player.show_finished(show or "this show",
+                                      self.images.get(self._up_next_url))
+            return
+
+        self._up_next = following
+        title, subtitle = episode_caption(following, show)
+        seconds = UP_NEXT_SECONDS if self.db.get_bool("autoplay_next", True) else 0
+        self._up_next_url = following.get("image_url") or ""
+        self.player.show_up_next(
+            title, subtitle, self.images.get(self._up_next_url), seconds)
+
+    def _play_up_next(self):
+        """The card was taken: Space, the play button, a click, or the clock."""
+        episode = self._up_next
+        self._up_next = None
+        if episode is not None:
+            self._play_episode(episode)
+
+    def _dismiss_up_next(self):
+        """The end-of-show card's way out: back to the page, pane folded away."""
+        self.player.hide_up_next()
+        if self._playing_series is not None:
+            self.open_series(self._playing_series)
+        self.set_player_visible(False)
+
+    def _up_next_image(self, url: str):
+        """The thumbnail arriving after the card was already drawn."""
+        if url and url == self._up_next_url and self.player.up_next_showing:
+            self.player.up_next.set_still(self.images.get(url))
 
     def replay_current(self):
         # The episode first: open_series() leaves _current_item pointing at the
@@ -1088,16 +1166,25 @@ class MainWindow(QMainWindow):
     def _step_episode(self, delta: int):
         """Within a series, step across season boundaries rather than stopping.
 
-        The page holds every episode of the show in order, so crossing from the
+        The list holds every episode of the show in order, so crossing from the
         last episode of one season into the first of the next needs no special
-        case - it is just the next entry.
+        case - it is just the next entry. Unlike the up-next card, ⏭ wraps: it
+        is a deliberate press, not something that happens on its own.
+
+        The list is the one captured when the episode started, not whatever the
+        page is showing now — open a second show while watching a first and the
+        two disagree.
         """
-        episodes = self.series_page.episodes()
+        episodes = self._episode_queue
         if not episodes:
             return
         current = getattr(self, "_current_episode", None)
-        position = (self.series_page.index_of(current["episode_id"])
-                    if current else -1)
+        position = -1
+        if current is not None:
+            for index, episode in enumerate(episodes):
+                if str(episode["episode_id"]) == str(current["episode_id"]):
+                    position = index
+                    break
         if self.player.bar.shuffle and len(episodes) > 1:
             import random
 
@@ -1200,6 +1287,8 @@ class MainWindow(QMainWindow):
         """
         if self.player.current_url or self.player.pending:
             return
+        if self.player.up_next_showing:
+            return          # the episode ended, but there is an offer on screen
         self.set_player_visible(False)
 
     def _toggle_advanced(self, enabled: bool):
@@ -1217,30 +1306,38 @@ class MainWindow(QMainWindow):
         self._effects_dialog.activateWindow()
 
     def _remember_position(self, fraction, position, duration):
-        if not self.playlist or not self._current_item or self.kind == "live":
+        if not self.playlist or duration <= 0 or position <= 0:
             return
-        if duration <= 0 or position <= 0:
+        target = self._history_target()
+        if target is None:
             return
-        episode_id = self._current_episode_id() or ""
+        kind, stream_id, episode_id = target
         self.db.execute(
             "INSERT INTO history(playlist_id, kind, stream_id, episode_id, position_secs,"
             " duration_secs, watched_at) VALUES(?,?,?,?,?,?,?) "
             "ON CONFLICT(playlist_id, kind, stream_id, episode_id) DO UPDATE SET "
             "position_secs=excluded.position_secs, duration_secs=excluded.duration_secs,"
             " watched_at=excluded.watched_at",
-            (self.playlist.id, self.kind, str(self._current_item[0]), episode_id,
+            (self.playlist.id, kind, stream_id, episode_id,
              int(position), int(duration), int(time.time())),
         )
 
-    def _current_episode_id(self):
-        """Which episode the position is being remembered against.
+    def _history_target(self):
+        """(kind, stream_id, episode_id) the position belongs to, or None.
 
-        Tracked from what was actually played rather than from a selected row:
-        that is what keeps the resume record pointing at the episode on screen
-        after next/previous has moved on from the one you clicked.
+        Taken from what is *playing*, never from the tab that is open or the
+        show being browsed: switch to Movies mid-episode, or open a second show
+        while a first one plays, and both of those have moved on while the
+        resume position still belongs where it started.
         """
-        episode = getattr(self, "_current_episode", None)
-        return str(episode["episode_id"]) if episode else ""
+        if self._current_episode is not None:
+            if not self._playing_series:
+                return None
+            return ("series", str(self._playing_series[0]),
+                    str(self._current_episode["episode_id"]))
+        if not self._current_item or self.kind == "live":
+            return None         # live has nothing to resume
+        return (self.kind, str(self._current_item[0]), "")
 
     # ------------------------------------------------- fullscreen and PiP
 
@@ -1922,9 +2019,19 @@ class MainWindow(QMainWindow):
             return
         client = self.client()
         url = client.episode_url(episode["episode_id"], episode["ext"])
-        show = self._current_series[1] if self._current_series else ""
-        title = f"{show} — S{episode['season']:02d}E{episode['episode']:02d}"
         self._current_episode = episode
+        # Adopt the page's show and episode list only when the episode actually
+        # came from that page. _current_series is whatever is being *browsed*,
+        # and browsing a second show while a first one plays must not rename
+        # what is playing, file its resume position under the wrong id, or swap
+        # the queue out from under it.
+        showing = self.series_page.episodes()
+        if any(str(item["episode_id"]) == str(episode["episode_id"])
+               for item in showing):
+            self._episode_queue = showing
+            self._playing_series = self._current_series
+        show = self._playing_series[1] if self._playing_series else ""
+        title = f"{show} — S{episode['season']:02d}E{episode['episode']:02d}"
         self.series_page.note_played(episode)
         self.now_title.setText(title)
         self.live_badge.hide()

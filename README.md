@@ -190,6 +190,11 @@ seen — the list groups them, and the sidebar count is taken the same way the
 list is built, including dropping titles the provider has since removed from the
 catalog. Otherwise the badge says a number you cannot see on screen.
 
+A position is filed against whatever is **playing**, not against the tab that
+happens to be open or the show you have since browsed to — change tab mid-
+episode, or open a second show while a first one plays, and the resume record
+still belongs where it started.
+
 ### Browse first
 
 The window opens on the catalog alone — no idle black rectangle taking a third
@@ -238,9 +243,23 @@ resumes where you stopped. Finish an episode and the button moves on to the next
 one, across season boundaries. Part-watched episodes carry a progress bar on
 their card.
 
+**One episode leads to the next.** When an episode ends, a card appears in the
+video area with the next one's still and a ten-second countdown, then plays it.
+`Space`, the play button or a click on the card starts it straight away;
+**Cancel** stops the clock and leaves the offer standing. `Settings ▸ Autoplay
+next episode` turns the countdown off — the card still appears, it just waits.
+At the end of the show the card says so and offers the way back instead.
+
+The card only appears because the episode has *ended*: the stream is stopped
+first, which frees the single connection the account allows and leaves the video
+area free to draw in. Qt cannot paint over libVLC's native view, which is why
+nothing tries to overlay a running picture.
+
 ⏮ and ⏭ follow what is playing rather than what is on screen: while an episode
 is playing they step through the show, across season boundaries, even after you
-have walked back to the catalog.
+have walked back to the catalog or opened a different show. Unlike the up-next
+card they wrap round at the end, because pressing a button is deliberate in a
+way a countdown is not.
 
 Only what the provider sends can be shown, and providers are inconsistent, so
 each field degrades quietly: the backdrop falls back to the cover, an episode
@@ -281,7 +300,7 @@ live channels.
 
 | Key | Action |
 |---|---|
-| `Space` | Play / pause |
+| `Space` | Play / pause · plays the next episode when the up-next card is up |
 | `←` `→` | Seek −10 s / +10 s |
 | `↑` `↓` | Volume −5 / +5 |
 | `M` | Mute |
@@ -451,7 +470,7 @@ ui/
   main_window.py        pane layout, tabs, the video pane's reveal
   category_tree.py      grouped sidebar
   models.py             virtualized model, poster cache, delegates
-  player_widget.py      libVLC surface and operations
+  player_widget.py      libVLC surface, operations, the up-next card
   search_page.py        master search across every kind
   series_page.py        series view, resume, wrapping layout
   transport_bar.py      VLC's control bar
