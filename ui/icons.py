@@ -182,6 +182,88 @@ def _volume_muted(p, c):
     p.drawLine(QPointF(90, 36), QPointF(64, 64))
 
 
+def _back(p, c):
+    _stroke(p, c, 10, Qt.FlatCap)
+    p.drawLine(QPointF(24, 50), QPointF(84, 50))
+    _fill(p, c)
+    _arrow_head(p, (16, 50), (46, 50), spread=30.0)
+
+
+def _director(p, c):
+    """A megaphone — the reference's glyph for the director row."""
+    _fill(p, c)
+    _triangle(p, [(20, 40), (54, 22), (54, 78), (20, 60)])
+    p.drawRoundedRect(QRectF(10, 40, 12, 20), 4, 4)
+    _stroke(p, c, 7)
+    for radius in (14, 26):
+        p.drawArc(QRectF(54 - radius, 50 - radius, radius * 2, radius * 2),
+                  -48 * 16, 96 * 16)
+
+
+def _calendar(p, c):
+    _stroke(p, c, 8)
+    p.drawRoundedRect(QRectF(12, 24, 76, 62), 8, 8)
+    p.drawLine(QPointF(12, 44), QPointF(88, 44))
+    _stroke(p, c, 8, Qt.RoundCap)
+    p.drawLine(QPointF(32, 14), QPointF(32, 30))
+    p.drawLine(QPointF(68, 14), QPointF(68, 30))
+    _fill(p, c)
+    for x in (28, 46, 64):
+        for y in (56, 72):
+            p.drawEllipse(QPointF(x, y), 5, 5)
+
+
+def _genre(p, c):
+    """A record with a note, for the genre row."""
+    _stroke(p, c, 8)
+    p.drawEllipse(QPointF(46, 54), 34, 34)
+    _fill(p, c)
+    p.drawEllipse(QPointF(46, 54), 7, 7)
+    _stroke(p, c, 7, Qt.FlatCap)
+    p.drawLine(QPointF(62, 26), QPointF(62, 56))
+    p.drawLine(QPointF(62, 26), QPointF(86, 18))
+    _fill(p, c)
+    p.drawEllipse(QPointF(56, 58), 9, 7)
+
+
+def _cast(p, c):
+    """Two theatre masks.
+
+    The back mask is only a crescent - the part that is not hidden behind the
+    front one. Drawing two full overlapping ellipses merged into a single blob
+    at 22px, which is the size this is actually used at.
+    """
+    _stroke(p, c, 7, Qt.FlatCap)
+    p.drawArc(QRectF(40, 16, 52, 62), 300 * 16, 130 * 16)
+    _stroke(p, c, 8)
+    p.drawEllipse(QRectF(10, 20, 54, 62))
+    _fill(p, c)
+    p.drawEllipse(QPointF(27, 44), 5, 6)
+    p.drawEllipse(QPointF(47, 44), 5, 6)
+    _stroke(p, c, 7, Qt.RoundCap)
+    p.drawArc(QRectF(24, 50, 26, 22), 200 * 16, 140 * 16)
+
+
+def _star(p, c):
+    import math
+
+    _fill(p, c)
+    points = []
+    for index in range(10):
+        radius = 40.0 if index % 2 == 0 else 17.0
+        angle = math.radians(-90 + index * 36)
+        points.append((50 + radius * math.cos(angle), 52 + radius * math.sin(angle)))
+    _triangle(p, points)
+
+
+def _info(p, c):
+    _stroke(p, c, 8)
+    p.drawEllipse(QPointF(50, 50), 36, 36)
+    _fill(p, c)
+    p.drawEllipse(QPointF(50, 30), 6, 6)
+    p.drawRoundedRect(QRectF(44, 42, 12, 32), 5, 5)
+
+
 def _pip(p, c):
     """A screen with a smaller picture inset at the bottom right."""
     _stroke(p, c, 8)
@@ -228,6 +310,13 @@ SHAPES = {
     "volume_muted": _volume_muted,
     "subtitles": _subtitles,
     "audio": _audio,
+    "back": _back,
+    "director": _director,
+    "calendar": _calendar,
+    "genre": _genre,
+    "cast": _cast,
+    "star": _star,
+    "info": _info,
 }
 
 

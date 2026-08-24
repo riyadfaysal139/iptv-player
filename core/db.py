@@ -110,8 +110,29 @@ CREATE TABLE IF NOT EXISTS series_episodes (
     container_extension TEXT,
     duration_secs       INTEGER,
     plot                TEXT,
+    image               TEXT,
     fetched_at          INTEGER,
     PRIMARY KEY (playlist_id, series_id, season, episode_num, episode_id)
+);
+
+-- The provider's series metadata, from get_series_info's "info" object. Kept
+-- apart from streams because it arrives per-series on demand, not in the bulk
+-- catalog sync, and most series never get opened.
+CREATE TABLE IF NOT EXISTS series_info (
+    playlist_id  INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    series_id    TEXT NOT NULL,
+    cover        TEXT,
+    backdrop     TEXT,
+    plot         TEXT,
+    cast_list    TEXT,      -- not "cast": that is a SQL keyword
+    director     TEXT,
+    genre        TEXT,
+    release_date TEXT,
+    rating       REAL,
+    run_time     INTEGER,
+    trailer      TEXT,
+    fetched_at   INTEGER,
+    PRIMARY KEY (playlist_id, series_id)
 );
 
 CREATE TABLE IF NOT EXISTS favourites (
@@ -236,6 +257,9 @@ class Database:
 
     MIGRATIONS = (
         ("streams", "dup_rank", "INTEGER NOT NULL DEFAULT 1"),
+        # series_episodes exists in every database already, so the new column
+        # cannot ride in on CREATE TABLE IF NOT EXISTS the way series_info does.
+        ("series_episodes", "image", "TEXT"),
     )
 
     def _migrate(self, conn):

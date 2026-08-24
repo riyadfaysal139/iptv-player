@@ -184,6 +184,35 @@ restores the provider's original ordering.
 Nothing is ever unreachable: items whose category is missing from the provider's
 own category list land in an **Uncategorized** bucket.
 
+**CONTINUE WATCHING** lists one row per title, most recent first. Watch history
+is stored per *episode*, so a show has as many history rows as episodes you have
+seen — the list groups them, and the sidebar count is taken the same way the
+list is built, including dropping titles the provider has since removed from the
+catalog. Otherwise the badge says a number you cannot see on screen.
+
+### Series
+
+Opening a show gives it the whole window: its backdrop behind, the poster, and
+the provider's metadata — director, release date, genre, cast, rating and plot —
+then a row of season buttons and a wrapping grid of episode cards.
+
+**Continue watching, per show.** The page remembers the last episode you played
+and opens on its season with a **Continue S01E04 · 12 min in** button that
+resumes where you stopped. Finish an episode and the button moves on to the next
+one, across season boundaries. Part-watched episodes carry a progress bar on
+their card.
+
+Only what the provider sends can be shown, and providers are inconsistent, so
+each field degrades quietly: the backdrop falls back to the cover, an episode
+with no still of its own borrows the series cover, and empty fields are simply
+blank. Metadata arrives with the episode list, on demand — a catalog of ten
+thousand shows is far too many to prefetch — and a show opened before this
+existed fills in its metadata the next time you open it.
+
+Because the account allows a single connection, refreshing a series while
+something is playing is refused by the provider. When that happens the page
+shows the episodes already saved rather than an error.
+
 ### Playback
 libVLC renders directly into a native widget. Live TV, movies and series
 episodes all play in-window, with resume-from-position.
@@ -379,6 +408,7 @@ ui/
   category_tree.py      grouped sidebar
   models.py             virtualized model, poster cache, delegates
   player_widget.py      libVLC surface and operations
+  series_page.py        full-window series view, resume, wrapping layout
   transport_bar.py      VLC's control bar
   effects_dialog.py     equalizer and video adjustments
   icons.py              painted transport icons

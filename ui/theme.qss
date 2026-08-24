@@ -252,3 +252,53 @@ QToolTip {
 }
 QStatusBar { background-color: #080c26; color: #7b84b4; }
 QStatusBar::item { border: none; }
+
+/* ---------- series page ---------- */
+/* The page paints its own darkened backdrop, so every widget on it has to be
+   transparent or the still would be hidden behind flat panels. */
+QWidget#seriesPage, QWidget#seriesBody, QScrollArea#seriesScroll,
+QScrollArea#seriesScroll > QWidget > QWidget,
+QWidget#metaRow, QWidget#seasonHolder, QWidget#episodeHolder,
+QLabel#metaBadge, QLabel#metaColon, QLabel#metaValue,
+QLabel#seriesTitle, QLabel#seriesStatus { background: transparent; }
+
+QPushButton#backButton {
+    background: transparent; border: none; border-radius: 6px;
+}
+QPushButton#backButton:hover { background-color: rgba(255, 255, 255, 0.10); }
+
+QLabel#seriesTitle {
+    font-size: 27px; font-weight: 700; color: #ffffff;
+}
+QLabel#seriesPoster {
+    background: transparent; border: none;
+}
+QLabel#metaColon  { color: #ffffff; font-size: 15px; }
+QLabel#metaValue  { color: #ffffff; font-size: 15px; }
+QLabel#seriesStatus { color: #9aa3cd; font-size: 14px; }
+
+QPushButton#continueButton {
+    background-color: #f5d90a; color: #06091c;
+    border: none; border-radius: 6px;
+    padding: 10px 20px; font-size: 14px; font-weight: 700;
+}
+QPushButton#continueButton:hover { background-color: #ffe533; }
+
+QPushButton#seasonButton {
+    background-color: rgba(6, 9, 28, 0.72);
+    border: 1px solid #3a4166; border-radius: 7px;
+    padding: 11px 26px; color: #ffffff; font-size: 14px;
+}
+QPushButton#seasonButton:hover { border-color: #6b74a8; }
+QPushButton#seasonButton[on="true"] { color: #f5d90a; font-weight: 700; }
+
+QFrame#episodeCard {
+    background-color: rgba(6, 9, 28, 0.72);
+    border: 1px solid #3a4166; border-radius: 7px;
+}
+QFrame#episodeCard:hover { border-color: #f5d90a; }
+QLabel#episodeImage { background: transparent; border: none; }
+QLabel#episodeCaption {
+    color: #ffffff; font-size: 12px; padding: 5px 6px 7px 6px;
+    background: transparent;
+}

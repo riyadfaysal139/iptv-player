@@ -417,8 +417,8 @@ class Syncer:
 def fetch_episodes(db: Database, playlist: Playlist, series_id) -> int:
     """Lazily load one series' episodes (10.7k series is far too many to prefetch)."""
     client = playlist.client()
-    info = client.series_info(series_id)
-    episodes = info.get("episodes") or {}
+    payload = client.series_info(series_id)
+    episodes = payload.get("episodes") or {}
     rows = []
     now = int(time.time())
     for season, items in episodes.items():
@@ -438,7 +438,8 @@ def fetch_episodes(db: Database, playlist: Playlist, series_id) -> int:
                     str(ep.get("id")), ep.get("title") or "",
                     ep.get("container_extension") or "mp4",
                     _as_int(meta.get("duration_secs")) or 0,
-                    meta.get("plot") or "", now,
+                    meta.get("plot") or "",
+                    episode_image(meta), now,
                 )
             )
     if rows:
@@ -449,10 +450,68 @@ def fetch_episodes(db: Database, playlist: Playlist, series_id) -> int:
         db.executemany(
             "INSERT OR REPLACE INTO series_episodes(playlist_id, series_id, season,"
             " episode_num, episode_id, title, container_extension, duration_secs,"
-            " plot, fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            " plot, image, fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
+    save_series_info(db, playlist.id, series_id, payload.get("info"), now)
     return len(rows)
+
+
+def episode_image(meta: dict) -> str:
+    """An episode still, if the provider ships one.
+
+    Providers are inconsistent about the key and often send an empty string or
+    the literal "null"; the caller falls back to the series cover when this is
+    empty, which is the common case.
+    """
+    for key in ("movie_image", "cover_big", "cover"):
+        value = (meta or {}).get(key)
+        if isinstance(value, str) and value.strip() and value.strip().lower() != "null":
+            return value.strip()
+    return ""
+
+
+def first_backdrop(value) -> str:
+    """backdrop_path is a list in Xtream's schema, but not always in practice."""
+    if isinstance(value, (list, tuple)):
+        value = next((v for v in value if isinstance(v, str) and v.strip()), "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def save_series_info(db: Database, playlist_id: int, series_id, info, now=None):
+    """Store get_series_info's "info" object.
+
+    The bulk catalog sync never sees this - it arrives per series, on demand -
+    so it is written here, where the episodes are fetched.
+    """
+    if not isinstance(info, dict) or not info:
+        return
+    db.execute(
+        "INSERT OR REPLACE INTO series_info(playlist_id, series_id, cover, backdrop,"
+        " plot, cast_list, director, genre, release_date, rating, run_time, trailer,"
+        " fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            playlist_id, str(series_id),
+            (info.get("cover") or "").strip(),
+            first_backdrop(info.get("backdrop_path")),
+            (info.get("plot") or "").strip(),
+            (info.get("cast") or "").strip(),
+            (info.get("director") or "").strip(),
+            (info.get("genre") or "").strip(),
+            (info.get("releaseDate") or info.get("release_date") or "").strip(),
+            _as_float(info.get("rating")),
+            _as_int(info.get("episode_run_time")),
+            (info.get("youtube_trailer") or "").strip(),
+            now if now is not None else int(time.time()),
+        ),
+    )
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _as_int(value):

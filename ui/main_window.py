@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStackedWidget,
-    QTabBar, QTextEdit, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QTabBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core import sync as sync_mod
@@ -28,6 +28,7 @@ from ui.models import (
 )
 from ui.player_widget import PlayerWidget
 from ui.playlist_dialog import PlaylistEditor, PlaylistManager
+from ui.series_page import SeriesPage
 from ui.subtitle_dialog import SubtitleDialog
 
 TABS = [("live", "TV"), ("movie", "MOVIES"), ("series", "SERIES")]
@@ -195,6 +196,7 @@ class MainWindow(QMainWindow):
         self._fs_overlay = None
         self._pip_state = None
         self._pip_hold_ms = 0
+        self._current_episode = None
 
         self.downloads = DownloadManager(db)
         self.downloads.start()
@@ -240,8 +242,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ ui
 
     def _build_ui(self):
+        # Two pages: the catalog (top bar + panes + player) and the full-window
+        # series view. The series page covers everything rather than sitting in
+        # a pane, because Qt widgets cannot draw over libVLC's native video view
+        # - the same constraint that put the fullscreen bar in its own window.
+        self._pages = QStackedWidget()
+        self.setCentralWidget(self._pages)
+
         central = QWidget()
-        self.setCentralWidget(central)
+        self._pages.addWidget(central)
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -316,13 +325,6 @@ class MainWindow(QMainWindow):
         self.list_view.setItemDelegate(self.channel_delegate)
         self.stack.addWidget(self.list_view)
 
-        self.episode_tree = QTreeWidget()
-        self.episode_tree.setHeaderHidden(True)
-        self.episode_tree.itemDoubleClicked.connect(self._play_episode)
-        self.episode_tree.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.episode_tree.customContextMenuRequested.connect(self._episode_menu)
-        self.stack.addWidget(self.episode_tree)
-
         self.downloads_panel = DownloadsPanel(self.downloads)
         self.downloads_panel.playRequested.connect(self.play_local)
         self.stack.addWidget(self.downloads_panel)
@@ -377,6 +379,7 @@ class MainWindow(QMainWindow):
             buttons.addWidget(button)
         buttons.addStretch(1)
         info_layout.addLayout(buttons)
+        self._build_series_page()
 
         self.epg_box = QVBoxLayout()
         info_layout.addLayout(self.epg_box)
@@ -455,7 +458,8 @@ class MainWindow(QMainWindow):
         self.flat_action.setChecked(self.db.get_bool("flat_categories", False))
         self.flat_action.toggled.connect(self._toggle_flat)
         view_menu.addAction(self.flat_action)
-        view_menu.addAction("Downloads", lambda: self.stack.setCurrentIndex(2))
+        view_menu.addAction("Downloads",
+                            lambda: self.stack.setCurrentWidget(self.downloads_panel))
         view_menu.addSeparator()
 
         # VLC hides the record/snapshot/A-B row behind the same menu item.
@@ -682,8 +686,15 @@ class MainWindow(QMainWindow):
             "favourites": self.db.scalar(
                 "SELECT COUNT(*) FROM favourites WHERE playlist_id=? AND kind=?",
                 (pid, kind), 0),
+            # Counted the way the list is built, so the badge cannot disagree
+            # with what you can see: one row per show (history holds a row per
+            # *episode*), and only shows still in the catalog — a watched title
+            # the provider has since dropped is not shown, so it is not counted.
             "continue": self.db.scalar(
-                "SELECT COUNT(*) FROM history WHERE playlist_id=? AND kind=?",
+                "SELECT COUNT(*) FROM (SELECT DISTINCT h.stream_id FROM history h "
+                "JOIN streams s ON s.playlist_id=h.playlist_id AND s.kind=h.kind "
+                "AND s.stream_id=h.stream_id AND s.available=1 AND s.name <> '' "
+                "WHERE h.playlist_id=? AND h.kind=?)",
                 (pid, kind), 0),
             "recent": self.db.scalar(
                 "SELECT COUNT(*) FROM streams WHERE playlist_id=? AND kind=? "
@@ -736,7 +747,7 @@ class MainWindow(QMainWindow):
             self.list_view.setSpacing(4)
         else:
             self.list_view.setSpacing(0)
-        self.stack.setCurrentIndex(0)
+        self.stack.setCurrentWidget(self.list_view)
         self.reload_catalog()
 
     def _category_filter(self, text):
@@ -750,10 +761,10 @@ class MainWindow(QMainWindow):
         if self.playlist is None:
             return
         if node_type == "downloads":
-            self.stack.setCurrentIndex(2)
+            self.stack.setCurrentWidget(self.downloads_panel)
             self.downloads_panel.refresh()
             return
-        self.stack.setCurrentIndex(0)
+        self.stack.setCurrentWidget(self.list_view)
         self._current_filter = (node_type, payload)
         self.apply_item_filter()
 
@@ -789,8 +800,14 @@ class MainWindow(QMainWindow):
             joins = ("JOIN favourites f ON f.playlist_id=s.playlist_id "
                      "AND f.kind=s.kind AND f.stream_id=s.stream_id")
         elif node_type == "continue":
-            joins = ("JOIN history h ON h.playlist_id=s.playlist_id "
-                     "AND h.kind=s.kind AND h.stream_id=s.stream_id")
+            # Grouped, not a plain join: history is keyed per *episode*, so a
+            # series with eight watched episodes joined straight through and
+            # appeared eight times in the list.
+            joins = ("JOIN (SELECT playlist_id, kind, stream_id,"
+                     " MAX(watched_at) AS watched_at FROM history"
+                     " GROUP BY playlist_id, kind, stream_id) h"
+                     " ON h.playlist_id=s.playlist_id AND h.kind=s.kind"
+                     " AND h.stream_id=s.stream_id")
             order = "h.watched_at DESC"
         elif node_type == "recent":
             where.append("s.added > ?")
@@ -864,6 +881,7 @@ class MainWindow(QMainWindow):
             )
             return
         self._current_item = row
+        self._current_episode = None
         client = self.client()
         stream_id, name, _, _, ext = row[0], row[1], row[2], row[3], row[4]
         is_live = self.kind == "live"
@@ -897,6 +915,7 @@ class MainWindow(QMainWindow):
     def play_local(self, path: str, title: str):
         """Downloaded files play from disk and use no connection."""
         self._current_item = None
+        self._current_episode = None
         self.now_title.setText(title)
         self.live_badge.hide()
         self.player.play(Path(path).absolute().as_uri(), title, is_live=False)
@@ -959,17 +978,18 @@ class MainWindow(QMainWindow):
             self.play_item(item)
 
     def _step_episode(self, delta: int):
-        """Within a series, step across season boundaries rather than stopping."""
-        tree = self.episode_tree
-        episodes = [
-            tree.topLevelItem(season).child(index)
-            for season in range(tree.topLevelItemCount())
-            for index in range(tree.topLevelItem(season).childCount())
-        ]
+        """Within a series, step across season boundaries rather than stopping.
+
+        The page holds every episode of the show in order, so crossing from the
+        last episode of one season into the first of the next needs no special
+        case - it is just the next entry.
+        """
+        episodes = self.series_page.episodes()
         if not episodes:
             return
-        current = tree.currentItem()
-        position = episodes.index(current) if current in episodes else -1
+        current = getattr(self, "_current_episode", None)
+        position = (self.series_page.index_of(current["episode_id"])
+                    if current else -1)
         if self.player.bar.shuffle and len(episodes) > 1:
             import random
 
@@ -979,9 +999,7 @@ class MainWindow(QMainWindow):
             position = choice
         else:
             position = (position + delta) % len(episodes)
-        target = episodes[position]
-        tree.setCurrentItem(target)
-        self._play_episode(target)
+        self._play_episode(episodes[position])
 
     # ------------------------------------------------------------- browser
 
@@ -1030,10 +1048,14 @@ class MainWindow(QMainWindow):
         )
 
     def _current_episode_id(self):
-        item = self.episode_tree.currentItem()
-        if item and item.data(0, Qt.UserRole):
-            return str(item.data(0, Qt.UserRole).get("episode_id", ""))
-        return ""
+        """Which episode the position is being remembered against.
+
+        Tracked from what was actually played rather than from a selected row:
+        that is what keeps the resume record pointing at the episode on screen
+        after next/previous has moved on from the one you clicked.
+        """
+        episode = getattr(self, "_current_episode", None)
+        return str(episode["episode_id"]) if episode else ""
 
     # ------------------------------------------------- fullscreen and PiP
 
@@ -1092,6 +1114,8 @@ class MainWindow(QMainWindow):
             return
         if self._pip_state:
             self.exit_pip()
+        if self.series_open:
+            self.close_series()
         self._fs_state = self._save_chrome()
         self._hide_chrome()
         self.showFullScreen()
@@ -1215,6 +1239,8 @@ class MainWindow(QMainWindow):
             return
         if self._fs_state:
             self.exit_fullscreen()
+        if self.series_open:
+            self.close_series()
 
         state = self._save_chrome()
         state["flags"] = self.windowFlags()
@@ -1436,6 +1462,9 @@ class MainWindow(QMainWindow):
         if key == Qt.Key_Escape and self._pip_state:
             self.exit_pip()
             return True
+        if key == Qt.Key_Escape and self.series_open:
+            self.close_series()
+            return True
         # Dialogs (VLSub, Effects) keep their own keyboard entirely — but the
         # test is "does another window own the focus", not "is this window
         # active". Going fullscreen leaves focusWidget() None and the window
@@ -1510,22 +1539,80 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- series
 
+    def _build_series_page(self):
+        self.series_page = SeriesPage(self.images)
+        self.series_page.backRequested.connect(self.close_series)
+        self.series_page.episodeActivated.connect(self._play_episode)
+        self.series_page.episodeMenuRequested.connect(self._episode_menu)
+        self._pages.addWidget(self.series_page)
+
+    @property
+    def series_open(self) -> bool:
+        return self._pages.currentWidget() is self.series_page
+
+    def close_series(self):
+        self._pages.setCurrentIndex(0)
+        self.player.surface.setFocus(Qt.OtherFocusReason)
+
+    EPISODE_COLUMNS = ("season, episode_num, episode_id, title, "
+                       "container_extension, image, duration_secs")
+
+    def _episode_rows(self, series_id) -> list:
+        rows = self.db.query(
+            f"SELECT {self.EPISODE_COLUMNS} FROM series_episodes "
+            "WHERE playlist_id=? AND series_id=? ORDER BY season, episode_num",
+            (self.playlist.id, str(series_id)),
+        )
+        cover = self._series_info(series_id).get("cover") or ""
+        out = []
+        for row in rows:
+            out.append({
+                "episode_id": row["episode_id"],
+                "ext": row["container_extension"] or "mp4",
+                "title": row["title"] or f"Episode {row['episode_num']}",
+                "season": row["season"],
+                "episode": row["episode_num"],
+                # Most providers ship no per-episode still; the series cover is
+                # what the reference screenshot falls back to as well.
+                "image_url": row["image"] or cover,
+            })
+        return out
+
+    def _series_info(self, series_id) -> dict:
+        row = self.db.one(
+            "SELECT cover, backdrop, plot, cast_list, director, genre,"
+            " release_date, rating FROM series_info WHERE playlist_id=? AND series_id=?",
+            (self.playlist.id, str(series_id)),
+        )
+        return dict(row) if row else {}
+
+    def _series_history(self, series_id) -> dict:
+        rows = self.db.query(
+            "SELECT episode_id, position_secs, duration_secs, watched_at FROM history"
+            " WHERE playlist_id=? AND kind='series' AND stream_id=? AND episode_id <> ''",
+            (self.playlist.id, str(series_id)),
+        )
+        return {str(r["episode_id"]): (r["position_secs"], r["duration_secs"],
+                                       r["watched_at"]) for r in rows}
+
     def open_series(self, row):
         self._current_item = row
         self._current_series = row
-        self.episode_tree.clear()
-        self.episode_tree.addTopLevelItem(QTreeWidgetItem(["Loading episodes…"]))
-        self.stack.setCurrentIndex(1)
+        # The page owns the whole window, so the other window modes have to go.
+        if self._fs_state:
+            self.exit_fullscreen()
+        if self._pip_state:
+            self.exit_pip()
+        self.series_page.set_loading(row[1])
+        self._pages.setCurrentWidget(self.series_page)
         self.now_title.setText(row[1])
 
-        cached = self.db.query(
-            "SELECT season, episode_num, episode_id, title, container_extension "
-            "FROM series_episodes WHERE playlist_id=? AND series_id=? "
-            "ORDER BY season, episode_num",
-            (self.playlist.id, str(row[0])),
-        )
-        if cached:
-            self._render_episodes(cached)
+        episodes = self._episode_rows(row[0])
+        # Both halves must be present: databases written before the series page
+        # existed have episodes cached but no info row, and would otherwise show
+        # six blank metadata lines forever.
+        if episodes and self._series_info(row[0]):
+            self._show_series(row[0])
             return
 
         self._episode_thread = QThread(self)
@@ -1538,83 +1625,68 @@ class MainWindow(QMainWindow):
 
     def _episodes_ready(self, series_id, error):
         if error:
-            self.episode_tree.clear()
-            self.episode_tree.addTopLevelItem(
-                QTreeWidgetItem([f"Could not load episodes: {error}"])
-            )
+            # Cached episodes beat an error page. The account allows a single
+            # connection, so a refetch fails outright whenever something is
+            # playing - and the episodes are usually already on disk, only the
+            # metadata is missing.
+            if self._episode_rows(series_id):
+                self._show_series(series_id)
+                self.series_page.set_error(f"Showing what was already saved — {error}")
+            else:
+                self.series_page.set_error(f"Could not load episodes: {error}")
             return
-        rows = self.db.query(
-            "SELECT season, episode_num, episode_id, title, container_extension "
-            "FROM series_episodes WHERE playlist_id=? AND series_id=? "
-            "ORDER BY season, episode_num",
-            (self.playlist.id, str(series_id)),
-        )
-        self._render_episodes(rows)
+        self._show_series(series_id)
 
-    def _render_episodes(self, rows):
-        self.episode_tree.clear()
-        seasons: dict[int, QTreeWidgetItem] = {}
-        for row in rows:
-            season = row["season"]
-            if season not in seasons:
-                node = QTreeWidgetItem([f"Season {season}"])
-                self.episode_tree.addTopLevelItem(node)
-                seasons[season] = node
-            label = row["title"] or f"Episode {row['episode_num']}"
-            child = QTreeWidgetItem([f"{row['episode_num']:>2}.  {label}"])
-            child.setData(0, Qt.UserRole, {
-                "episode_id": row["episode_id"],
-                "ext": row["container_extension"] or "mp4",
-                "title": label,
-                "season": season,
-                "episode": row["episode_num"],
-            })
-            seasons[season].addChild(child)
-        for node in seasons.values():
-            node.setExpanded(True)
-        if not rows:
-            self.episode_tree.addTopLevelItem(QTreeWidgetItem(["No episodes listed"]))
+    def _show_series(self, series_id):
+        show = self._current_series[1] if self._current_series else ""
+        info = self._series_info(series_id)
+        if not info.get("cover") and self._current_series is not None:
+            # Fall back to the catalog row's icon when the provider sent no
+            # per-series cover with get_series_info.
+            info["cover"] = self._current_series[2] or ""
+        self.series_page.set_series(show, info, self._episode_rows(series_id),
+                                    self._series_history(series_id))
 
-    def _play_episode(self, item, _column=0):
-        data = item.data(0, Qt.UserRole)
-        if not data:
+    def _play_episode(self, episode, resume_secs: int = 0):
+        if not episode:
             return
         client = self.client()
-        url = client.episode_url(data["episode_id"], data["ext"])
+        url = client.episode_url(episode["episode_id"], episode["ext"])
         show = self._current_series[1] if self._current_series else ""
-        title = f"{show} — S{data['season']:02d}E{data['episode']:02d}"
+        title = f"{show} — S{episode['season']:02d}E{episode['episode']:02d}"
+        self._current_episode = episode
+        self.series_page.note_played(episode)
         self.now_title.setText(title)
         self.live_badge.hide()
-        self.player.play(url, title, is_live=False)
+        # Back to the catalog page: the player lives there, and playing into a
+        # hidden widget would leave you looking at the series page.
+        self.close_series()
+        self.player.play(url, title, is_live=False, resume_secs=int(resume_secs or 0))
 
-    def _episode_menu(self, point):
-        item = self.episode_tree.itemAt(point)
-        if item is None or not item.data(0, Qt.UserRole):
-            return
+    def _episode_menu(self, episode, position):
         menu = QMenu(self)
-        menu.addAction("Play", lambda: self._play_episode(item))
-        menu.addAction("⤓ Download episode", lambda: self._download_episode(item))
-        parent = item.parent()
-        if parent:
-            menu.addAction(
-                "⤓ Download all episodes in season",
-                lambda: [self._download_episode(parent.child(i))
-                         for i in range(parent.childCount())],
-            )
-        menu.exec(self.episode_tree.viewport().mapToGlobal(point))
+        menu.addAction("Play", lambda: self._play_episode(episode))
+        menu.addAction("⤓ Download episode", lambda: self._download_episode(episode))
+        season = episode["season"]
+        menu.addAction(
+            "⤓ Download all episodes in season",
+            lambda: [self._download_episode(item)
+                     for item in self.series_page.episodes()
+                     if item["season"] == season],
+        )
+        menu.exec(position)
 
-    def _download_episode(self, item):
-        data = item.data(0, Qt.UserRole)
-        if not data or not self._current_series:
+    def _download_episode(self, episode):
+        if not episode or not self._current_series:
             return
         client = self.client()
-        url = client.episode_url(data["episode_id"], data["ext"])
+        url = client.episode_url(episode["episode_id"], episode["ext"])
         self.downloads.enqueue(
-            self.playlist.id, "series", self._current_series[0], data["title"], url,
-            episode_id=str(data["episode_id"]), show=self._current_series[1],
-            season=data["season"], episode=data["episode"], ext=data["ext"],
+            self.playlist.id, "series", self._current_series[0], episode["title"], url,
+            episode_id=str(episode["episode_id"]), show=self._current_series[1],
+            season=episode["season"], episode=episode["episode"], ext=episode["ext"],
         )
-        self.statusBar().showMessage(f"Queued {data['title']}", 4000)
+        self.statusBar().showMessage(f"Queued {episode['title']}", 4000)
 
     # ------------------------------------------------------------------ EPG
 
@@ -1810,10 +1882,9 @@ class MainWindow(QMainWindow):
         # worth fingerprinting.
         url = self.player.current_url
         season = episode = 0
-        item = self.episode_tree.currentItem()
-        if item and item.data(0, Qt.UserRole):
-            data = item.data(0, Qt.UserRole)
-            season, episode = data["season"], data["episode"]
+        playing = getattr(self, "_current_episode", None)
+        if playing:
+            season, episode = playing["season"], playing["episode"]
         dialog = SubtitleDialog(self, self.db, title, url, season, episode)
         dialog.subtitleChosen.connect(self._apply_subtitle)
         dialog.exec()

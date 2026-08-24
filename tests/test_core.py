@@ -441,6 +441,271 @@ class TestSeekClamp(unittest.TestCase):
         self.assertEqual(self.clamp(200, 10, 500), 0)
 
 
+class TestContinueWatching(unittest.TestCase):
+    """One row per show, not one per watched episode.
+
+    history is keyed per episode, so a plain join multiplied a series by the
+    number of episodes watched - eight copies of the same show in the list, and
+    a sidebar count that disagreed with what was on screen.
+    """
+
+    CONTINUE_JOIN = (
+        "JOIN (SELECT playlist_id, kind, stream_id,"
+        " MAX(watched_at) AS watched_at FROM history"
+        " GROUP BY playlist_id, kind, stream_id) h"
+        " ON h.playlist_id=s.playlist_id AND h.kind=s.kind"
+        " AND h.stream_id=s.stream_id"
+    )
+
+    def setUp(self):
+        import tempfile
+
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = Database(self.dir / "t.sqlite")
+        self.db.execute(
+            "INSERT INTO playlists(id, name, type, position) VALUES(1,'p','xtream',0)")
+        for stream_id, name in (("100", "Trailer Park Boys"), ("200", "Other Show")):
+            self.db.execute(
+                "INSERT INTO streams(playlist_id, kind, stream_id, name, name_folded,"
+                " available) VALUES(1,'series',?,?,?,1)",
+                (stream_id, name, name.lower()),
+            )
+        # Eight episodes of one show, one of the other.
+        for index in range(8):
+            self.db.execute(
+                "INSERT INTO history(playlist_id, kind, stream_id, episode_id,"
+                " position_secs, duration_secs, watched_at) VALUES(1,'series','100',?,"
+                " 60, 1200, ?)", (f"e{index}", 1000 + index),
+            )
+        self.db.execute(
+            "INSERT INTO history(playlist_id, kind, stream_id, episode_id,"
+            " position_secs, duration_secs, watched_at)"
+            " VALUES(1,'series','200','x', 60, 1200, 900)")
+
+    def tearDown(self):
+        import shutil
+
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_show_appears_once_however_many_episodes_were_watched(self):
+        rows = self.db.query(
+            "SELECT s.stream_id, s.name FROM streams s " + self.CONTINUE_JOIN +
+            " WHERE s.playlist_id=1 AND s.kind='series' ORDER BY h.watched_at DESC")
+        self.assertEqual([r["name"] for r in rows],
+                         ["Trailer Park Boys", "Other Show"])
+
+    def test_the_old_unaggregated_join_is_what_produced_the_duplicates(self):
+        """Guards the fix: the naive join returns nine rows for two shows."""
+        rows = self.db.query(
+            "SELECT s.stream_id FROM streams s "
+            "JOIN history h ON h.playlist_id=s.playlist_id AND h.kind=s.kind "
+            "AND h.stream_id=s.stream_id WHERE s.playlist_id=1 AND s.kind='series'")
+        self.assertEqual(len(rows), 9)
+
+    CONTINUE_COUNT = (
+        "SELECT COUNT(*) FROM (SELECT DISTINCT h.stream_id FROM history h "
+        "JOIN streams s ON s.playlist_id=h.playlist_id AND s.kind=h.kind "
+        "AND s.stream_id=h.stream_id AND s.available=1 AND s.name <> '' "
+        "WHERE h.playlist_id=1 AND h.kind='series')"
+    )
+
+    def test_the_count_matches_the_number_of_rows_shown(self):
+        self.assertEqual(self.db.scalar(self.CONTINUE_COUNT, (), 0), 2)
+
+    def test_a_show_dropped_from_the_catalog_is_not_counted(self):
+        """History outlives the catalog: a title the provider removed cannot be
+        listed, so counting it made the badge disagree with the list."""
+        self.db.execute(
+            "INSERT INTO history(playlist_id, kind, stream_id, episode_id,"
+            " position_secs, duration_secs, watched_at)"
+            " VALUES(1,'series','999','g', 60, 1200, 500)")
+        self.assertEqual(self.db.scalar(self.CONTINUE_COUNT, (), 0), 2)
+        rows = self.db.query(
+            "SELECT s.stream_id FROM streams s " + self.CONTINUE_JOIN +
+            " WHERE s.playlist_id=1 AND s.kind='series'")
+        self.assertEqual(len(rows), 2)
+
+    def test_an_unavailable_show_is_neither_listed_nor_counted(self):
+        self.db.execute("UPDATE streams SET available=0 WHERE stream_id='200'")
+        self.assertEqual(self.db.scalar(self.CONTINUE_COUNT, (), 0), 1)
+
+    def test_most_recently_watched_show_sorts_first(self):
+        rows = self.db.query(
+            "SELECT s.name FROM streams s " + self.CONTINUE_JOIN +
+            " WHERE s.playlist_id=1 AND s.kind='series' ORDER BY h.watched_at DESC")
+        self.assertEqual(rows[0]["name"], "Trailer Park Boys")
+
+
+class TestResumePick(unittest.TestCase):
+    """Which episode the Continue button offers — the Netflix rule."""
+
+    def setUp(self):
+        from ui.series_page import WATCHED_FRACTION, describe_resume, pick_resume
+
+        self.pick = pick_resume
+        self.describe = describe_resume
+        self.watched = WATCHED_FRACTION
+        self.episodes = [
+            {"episode_id": f"s{season}e{num}", "season": season, "episode": num}
+            for season in (1, 2) for num in (1, 2, 3)
+        ]
+
+    def test_nothing_watched_offers_the_first_episode(self):
+        episode, resume = self.pick(self.episodes, {})
+        self.assertEqual(episode["episode_id"], "s1e1")
+        self.assertEqual(resume, 0)
+
+    def test_part_way_through_resumes_that_episode(self):
+        episode, resume = self.pick(self.episodes, {"s1e2": (400, 1200, 50)})
+        self.assertEqual(episode["episode_id"], "s1e2")
+        self.assertEqual(resume, 400)
+
+    def test_a_finished_episode_moves_on_to_the_next(self):
+        history = {"s1e2": (int(1200 * self.watched) + 1, 1200, 50)}
+        episode, resume = self.pick(self.episodes, history)
+        self.assertEqual(episode["episode_id"], "s1e3")
+        self.assertEqual(resume, 0)
+
+    def test_finishing_a_season_crosses_into_the_next(self):
+        history = {"s1e3": (1200, 1200, 50)}
+        episode, _ = self.pick(self.episodes, history)
+        self.assertEqual(episode["episode_id"], "s2e1")
+
+    def test_the_most_recent_episode_wins_not_the_furthest(self):
+        """Re-watching an early episode is what you want to continue from."""
+        history = {"s2e3": (300, 1200, 10), "s1e1": (200, 1200, 99)}
+        episode, resume = self.pick(self.episodes, history)
+        self.assertEqual(episode["episode_id"], "s1e1")
+        self.assertEqual(resume, 200)
+
+    def test_finishing_the_last_episode_offers_it_again(self):
+        history = {"s2e3": (1200, 1200, 50)}
+        episode, resume = self.pick(self.episodes, history)
+        self.assertEqual(episode["episode_id"], "s2e3")
+        self.assertEqual(resume, 0)
+
+    def test_history_for_an_unknown_episode_is_ignored(self):
+        """Episodes disappear when a provider renumbers a series."""
+        episode, _ = self.pick(self.episodes, {"gone": (400, 1200, 999)})
+        self.assertEqual(episode["episode_id"], "s1e1")
+
+    def test_no_episodes_offers_nothing(self):
+        self.assertEqual(self.pick([], {"s1e1": (10, 20, 1)}), (None, 0))
+
+    def test_zero_duration_does_not_divide_by_zero(self):
+        episode, resume = self.pick(self.episodes, {"s1e2": (400, 0, 50)})
+        self.assertEqual(episode["episode_id"], "s1e2")
+        self.assertEqual(resume, 400)
+
+    def test_the_button_says_what_it_will_do(self):
+        self.assertEqual(self.describe(self.episodes[1], 0), "Play S01E02")
+        self.assertEqual(self.describe(self.episodes[1], 400),
+                         "Continue S01E02 · 6 min in")
+        # A few seconds in is a restart, not a resume worth announcing.
+        self.assertEqual(self.describe(self.episodes[0], 5), "Play S01E01")
+
+
+class TestFlowLayout(unittest.TestCase):
+    """Episode cards wrap instead of scrolling sideways.
+
+    Driven with stub items rather than real widgets so it needs no QApplication
+    and no display — the layout only ever asks an item for its size hint and
+    hands it a rectangle.
+    """
+
+    class Stub:
+        def __init__(self, width, height):
+            from PySide6.QtCore import QSize
+
+            self._size = QSize(width, height)
+            self.rect = None
+
+        def sizeHint(self):
+            return self._size
+
+        def minimumSize(self):
+            return self._size
+
+        def setGeometry(self, rect):
+            self.rect = rect
+
+    def _layout(self, count=6, spacing=10, size=(268, 190)):
+        from ui.series_page import FlowLayout
+
+        layout = FlowLayout(None, margin=0, spacing=spacing)
+        items = [self.Stub(*size) for _ in range(count)]
+        for item in items:
+            layout.addItem(item)
+        return layout, items
+
+    def test_a_narrower_view_needs_more_height(self):
+        layout, _ = self._layout()
+        wide = layout.heightForWidth(1200)
+        medium = layout.heightForWidth(600)
+        narrow = layout.heightForWidth(280)
+        self.assertLess(wide, medium)
+        self.assertLess(medium, narrow)
+
+    def test_items_land_on_wrapped_rows(self):
+        from PySide6.QtCore import QRect
+
+        layout, items = self._layout()
+        layout.setGeometry(QRect(0, 0, 600, 2000))
+        rows = sorted({item.rect.y() for item in items})
+        columns = sorted({item.rect.x() for item in items})
+        self.assertEqual(len(columns), 2)      # two fit across 600px
+        self.assertEqual(len(rows), 3)         # so six need three rows
+        self.assertTrue(all(item.rect.x() >= 0 for item in items))
+
+    def test_one_column_when_nothing_else_fits(self):
+        from PySide6.QtCore import QRect
+
+        layout, items = self._layout(count=4)
+        layout.setGeometry(QRect(0, 0, 300, 2000))
+        self.assertEqual(len({item.rect.y() for item in items}), 4)
+
+    def test_an_empty_layout_is_harmless(self):
+        layout, _ = self._layout(count=0)
+        self.assertEqual(layout.count(), 0)
+        self.assertGreaterEqual(layout.heightForWidth(800), 0)
+
+
+class TestSeriesInfoParsing(unittest.TestCase):
+    """The provider's info object, which varies more than its schema admits."""
+
+    def setUp(self):
+        from core.sync import episode_image, first_backdrop
+
+        self.image = episode_image
+        self.backdrop = first_backdrop
+
+    def test_backdrop_is_a_list_in_the_schema(self):
+        self.assertEqual(self.backdrop(["http://a/1.jpg", "http://a/2.jpg"]),
+                         "http://a/1.jpg")
+
+    def test_backdrop_is_sometimes_a_bare_string(self):
+        self.assertEqual(self.backdrop("http://a/1.jpg"), "http://a/1.jpg")
+
+    def test_backdrop_missing_or_empty(self):
+        for value in (None, [], [""], "", "   ", 17):
+            self.assertEqual(self.backdrop(value), "", value)
+
+    def test_episode_image_prefers_the_still(self):
+        self.assertEqual(
+            self.image({"movie_image": "http://a/s.jpg", "cover": "http://a/c.jpg"}),
+            "http://a/s.jpg")
+
+    def test_episode_image_falls_through_the_alternatives(self):
+        self.assertEqual(self.image({"cover_big": "http://a/b.jpg"}), "http://a/b.jpg")
+
+    def test_the_literal_string_null_is_not_a_url(self):
+        """Providers send "null" as text often enough to matter."""
+        self.assertEqual(self.image({"movie_image": "null", "cover": " "}), "")
+        self.assertEqual(self.image({}), "")
+        self.assertEqual(self.image(None), "")
+
+
 class TestPipRect(unittest.TestCase):
     """Where the Picture-in-Picture window lands.
 
