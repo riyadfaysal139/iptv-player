@@ -1195,5 +1195,220 @@ class TestSubtitleHash(unittest.TestCase):
             server.server_close()
 
 
+class TestHomeSections(unittest.TestCase):
+    """The homepage wall: the one place all three kinds appear together."""
+
+    def setUp(self):
+        import tempfile
+        import time
+
+        from ui.home_page import MIN_RAIL, home_sections
+
+        self.build = home_sections
+        self.min_rail = MIN_RAIL
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = Database(self.dir / "t.sqlite")
+        self.db.execute(
+            "INSERT INTO playlists(id, name, type, position) VALUES(1,'p','xtream',0)")
+        self.now = int(time.time())
+        # Enough of each kind that the "new" rails clear MIN_RAIL.
+        for kind in ("live", "movie", "series"):
+            for n in range(8):
+                self.add(kind, f"{kind}{n}", f"{kind.title()} {n}")
+
+    def tearDown(self):
+        import shutil
+
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def add(self, kind, stream_id, name, available=1, dup_rank=1, category=None,
+            added=None):
+        self.db.execute(
+            "INSERT INTO streams(playlist_id, kind, stream_id, name, name_folded,"
+            " available, dup_rank, category_id, added) VALUES(1,?,?,?,?,?,?,?,?)",
+            (kind, stream_id, name, fold(name), available, dup_rank, category,
+             self.now if added is None else added),
+        )
+
+    def category(self, kind, category_id, sub_name, group="Genres", count=100):
+        self.db.execute(
+            "INSERT INTO categories(playlist_id, kind, category_id, name,"
+            " group_name, sub_name, item_count) VALUES(1,?,?,?,?,?,?)",
+            (kind, category_id, sub_name, group, sub_name, count),
+        )
+
+    def watch(self, kind, stream_id, when, episode=""):
+        self.db.execute(
+            "INSERT INTO history(playlist_id, kind, stream_id, episode_id,"
+            " position_secs, duration_secs, watched_at) VALUES(1,?,?,?,60,600,?)",
+            (kind, stream_id, episode, when),
+        )
+
+    def favourite(self, kind, stream_id, when):
+        self.db.execute(
+            "INSERT INTO favourites(playlist_id, kind, stream_id, added_at)"
+            " VALUES(1,?,?,?)", (kind, stream_id, when))
+
+    def sections(self, **kw):
+        return {key: (rows, kinds, target)
+                for key, _title, rows, kinds, target in self.build(self.db, 1, **kw)}
+
+    # -- the personal rails -------------------------------------------------
+
+    def test_continue_watching_mixes_kinds_in_one_rail(self):
+        """The whole point: films and shows side by side, which no other view does."""
+        self.watch("movie", "movie1", 100)
+        self.watch("series", "series2", 200)
+        self.watch("live", "live3", 300)
+        rows, kinds, _ = self.sections()["continue"]
+        self.assertEqual(kinds, ["live", "series", "movie"])   # most recent first
+        self.assertEqual([r[0] for r in rows], ["live3", "series2", "movie1"])
+
+    def test_a_show_watched_episode_by_episode_appears_once(self):
+        """History is keyed per episode; ungrouped, one show fills the rail."""
+        for number in range(6):
+            self.watch("series", "series1", 100 + number, episode=f"e{number}")
+        rows, _, _ = self.sections()["continue"]
+        self.assertEqual([r[0] for r in rows], ["series1"])
+
+    def test_the_personal_rails_are_dropped_when_empty(self):
+        """A new install has neither, and two empty headings is not a homepage."""
+        sections = self.sections()
+        self.assertNotIn("continue", sections)
+        self.assertNotIn("favourites", sections)
+
+    def test_favourites_are_newest_first_and_mix_kinds(self):
+        self.favourite("movie", "movie1", 100)
+        self.favourite("live", "live2", 200)
+        rows, kinds, _ = self.sections()["favourites"]
+        self.assertEqual(kinds, ["live", "movie"])
+        self.assertEqual([r[0] for r in rows], ["live2", "movie1"])
+
+    def test_a_catalog_with_nothing_in_it_yields_no_rails_at_all(self):
+        """What the page's empty state is driven by — not ten blank headings."""
+        self.db.execute("DELETE FROM streams WHERE playlist_id=1")
+        self.assertEqual(self.build(self.db, 1), [])
+
+    def test_a_watched_title_the_provider_dropped_is_not_offered(self):
+        """available=0 rows would render as a dead cell you cannot play."""
+        self.add("movie", "gone", "Gone", available=0)
+        self.watch("movie", "gone", 100)
+        self.assertNotIn("continue", self.sections())
+
+    def test_history_for_a_title_not_in_the_catalog_is_ignored(self):
+        self.watch("movie", "nosuch", 100)
+        self.assertNotIn("continue", self.sections())
+
+    # -- the generated rails ------------------------------------------------
+
+    def test_every_kind_gets_a_new_rail(self):
+        sections = self.sections()
+        for key in ("new_movie", "new_series", "new_live"):
+            self.assertIn(key, sections)
+
+    def test_duplicates_and_nameless_rows_never_appear(self):
+        self.add("movie", "dup", "Dup", dup_rank=2)
+        self.add("movie", "blank", "")
+        ids = [r[0] for r in self.sections()["new_movie"][0]]
+        self.assertNotIn("dup", ids)
+        self.assertNotIn("blank", ids)
+
+    def test_rails_are_capped(self):
+        for n in range(40):
+            self.add("movie", f"extra{n}", f"Extra {n}")
+        self.assertEqual(len(self.sections(cap=7)["new_movie"][0]), 7)
+
+    def test_kinds_line_up_with_rows_one_for_one(self):
+        self.watch("movie", "movie1", 100)
+        self.favourite("series", "series1", 100)
+        for _key, (rows, kinds, _target) in self.sections().items():
+            self.assertEqual(len(rows), len(kinds))
+
+    # -- genres -------------------------------------------------------------
+
+    def test_genre_rails_come_from_the_providers_taxonomy(self):
+        self.category("movie", "c1", "Horror", count=500)
+        for n in range(8):
+            self.add("movie", f"h{n}", f"Horror {n}", category="c1")
+        sections = self.sections()
+        self.assertIn("genre_movie_c1", sections)
+        rows, kinds, target = sections["genre_movie_c1"]
+        self.assertEqual(kinds, ["movie"] * len(rows))
+        self.assertEqual(target, ("movie", "category", "c1"))
+
+    def test_no_genre_taxonomy_means_no_genre_rails(self):
+        """Not five empty headings — providers differ, and many ship none."""
+        keys = self.sections()
+        self.assertFalse([k for k in keys if k.startswith("genre_")])
+
+    def test_a_genre_too_small_to_fill_a_rail_is_skipped(self):
+        self.category("movie", "c2", "Tiny", count=500)
+        self.add("movie", "t1", "Tiny One", category="c2")
+        self.assertNotIn("genre_movie_c2", self.sections())
+
+    def test_show_genres_are_labelled_so_headings_do_not_collide(self):
+        """Both taxonomies have a Documentary; two identical headings confuse."""
+        self.category("movie", "m1", "Documentary", count=900)
+        self.category("series", "s1", "Documentary", count=800)
+        for n in range(8):
+            self.add("movie", f"md{n}", f"Doc {n}", category="m1")
+            self.add("series", f"sd{n}", f"Show Doc {n}", category="s1")
+        titles = [title for _k, title, _r, _ki, _t in self.build(self.db, 1)]
+        self.assertIn("DOCUMENTARY", titles)
+        self.assertIn("SHOWS · DOCUMENTARY", titles)
+        self.assertEqual(len(titles), len(set(titles)))
+
+    def test_the_wall_is_capped_and_keeps_the_personal_rails(self):
+        from ui.home_page import MAX_RAILS
+
+        self.watch("movie", "movie1", 100)
+        self.favourite("movie", "movie2", 100)
+        for n in range(20):
+            self.category("movie", f"g{n}", f"Genre {n}", count=1000 - n)
+            for m in range(8):
+                self.add("movie", f"g{n}i{m}", f"G{n} {m}", category=f"g{n}")
+        sections = self.build(self.db, 1)
+        keys = [key for key, _t, _r, _k, _ta in sections]
+        self.assertLessEqual(len(sections), MAX_RAILS + 2)
+        self.assertEqual(keys[0], "continue")
+        self.assertEqual(keys[1], "favourites")
+
+
+class TestCatalogModelKinds(unittest.TestCase):
+    """Per-item kinds, which the mixed homepage rails need."""
+
+    def setUp(self):
+        # No QApplication: a QAbstractListModel is a plain QObject, and the
+        # suite is meant to run headless.
+        from ui.models import ROLE_KIND, CatalogModel
+
+        self.role = ROLE_KIND
+        self.model = CatalogModel()
+        self.rows = [("1", "A"), ("2", "B")]
+
+    def kinds(self):
+        return [self.model.index(i, 0).data(self.role)
+                for i in range(self.model.rowCount())]
+
+    def test_without_a_kinds_list_every_row_reports_the_models_kind(self):
+        """Every existing caller passes no kinds and must be unaffected."""
+        self.model.set_rows(self.rows, "movie")
+        self.assertEqual(self.kinds(), ["movie", "movie"])
+
+    def test_a_kinds_list_gives_each_row_its_own(self):
+        self.model.set_rows(self.rows, "movie", None, ["live", "series"])
+        self.assertEqual(self.kinds(), ["live", "series"])
+
+    def test_a_short_kinds_list_falls_back_rather_than_raising(self):
+        self.model.set_rows(self.rows, "movie", None, ["live"])
+        self.assertEqual(self.kinds(), ["live", "movie"])
+
+    def test_setting_rows_again_without_kinds_clears_the_old_ones(self):
+        self.model.set_rows(self.rows, "movie", None, ["live", "series"])
+        self.model.set_rows(self.rows, "movie")
+        self.assertEqual(self.kinds(), ["movie", "movie"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

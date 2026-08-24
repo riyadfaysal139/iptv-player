@@ -187,6 +187,26 @@ QLabel#playerOverlay {
     font-size: 14px;
     padding: 24px;
 }
+/* the homepage: rails of posters ----------------------------------------- */
+QWidget#homePage, QScrollArea#homeScroll, QWidget#homeBody {
+    background-color: #070b22;
+    border: none;
+}
+QWidget#homeRail { background: transparent; }
+QLabel#railHeading {
+    background: transparent;
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+QLabel#homeEmpty {
+    background: transparent;
+    color: #8e97c4;
+    font-size: 15px;
+    padding: 60px 20px;
+}
+
 /* the card an episode ending leaves behind ------------------------------- */
 QFrame#upNext {
     background-color: #05081a;
@@ -342,10 +362,11 @@ QLabel#episodeCaption {
 }
 
 /* ---------- master search ---------- */
-QPushButton#masterSearchButton {
+QPushButton#masterSearchButton, QPushButton#topBarButton {
     background: transparent; border: none; border-radius: 6px;
 }
-QPushButton#masterSearchButton:hover { background-color: #101841; }
+QPushButton#masterSearchButton:hover,
+QPushButton#topBarButton:hover { background-color: #101841; }
 
 QWidget#searchPage, QWidget#searchBody, QScrollArea#searchScroll,
 QScrollArea#searchScroll > QWidget > QWidget,

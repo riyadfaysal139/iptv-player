@@ -210,16 +210,31 @@ class CatalogModel(QAbstractListModel):
         super().__init__(parent)
         self._rows: list[tuple] = []
         self._kind = "live"
+        self._kinds: list[str] | None = None
         self._favourites: set[str] = set()
 
-    def set_rows(self, rows, kind: str, favourites: set[str] | None = None):
+    def set_rows(self, rows, kind: str, favourites: set[str] | None = None,
+                 kinds=None):
+        """`kinds` is a per-row kind, for lists that mix them.
+
+        The homepage puts a film and a show in the same row, so one kind for
+        the whole model is not enough there. Everywhere else there is exactly
+        one kind and `kinds` stays None, which is what ROLE_KIND falls back to.
+        """
         self.beginResetModel()
         self._rows = rows
         self._kind = kind
+        self._kinds = list(kinds) if kinds is not None else None
         self._favourites = favourites or set()
         self.endResetModel()
 
     def kind(self) -> str:
+        return self._kind
+
+    def kind_at(self, row: int) -> str:
+        """This row's own kind, or the model's when the list is not mixed."""
+        if self._kinds is not None and 0 <= row < len(self._kinds):
+            return self._kinds[row]
         return self._kind
 
     def rowCount(self, parent=QModelIndex()) -> int:
@@ -236,7 +251,7 @@ class CatalogModel(QAbstractListModel):
         if role == ROLE_STREAM_ID:
             return row[0]
         if role == ROLE_KIND:
-            return self._kind
+            return self.kind_at(index.row())
         if role == Qt.ToolTipRole:
             if len(row) > 6 and not row[6]:
                 return f"{row[1]}\n(No longer offered by the provider)"

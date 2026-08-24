@@ -167,6 +167,31 @@ in automatically and the app probes for an Xtream API.
 
 ## Features
 
+### The homepage
+
+The house icon beside the magnifier — and where the app opens — is the one place
+channels, films and shows appear together. Everywhere else shows a single kind,
+because the catalog list pins its query to whichever tab is open.
+
+Rows of posters that scroll sideways: **Continue Watching** and **Favourites**
+first, both mixing all three kinds, then what is new in each, the biggest live
+group, and the provider's own biggest genres. The genre rows are read from the
+catalog rather than hard-coded, so a provider that ships no genre taxonomy gets
+none instead of a screen of empty headings, and a row with fewer than six titles
+in it is dropped — that is a gap with a heading on it, not a row.
+
+Double-click plays, and **leaves you on the homepage** with the video docked
+beside it; only a show takes you away, to its own page. **See all** on a row
+hands over to the sidebar node it corresponds to.
+
+The personal rows are the reason the queries are shaped the way they are. Joined
+the obvious way — 93,000 `streams` rows against a grouped `history` subquery —
+SQLite drives from `streams` and the row costs **57 ms warm, a full second
+cold**. Selecting the handful of watched ids first and seeking `streams` by
+primary key measures **0.0 ms**. The `CROSS JOIN` that does it is not
+decoration: written as a plain `JOIN` the planner reorders it straight back to
+the slow plan. The whole page builds in **57 ms**.
+
 ### Playlists
 Add, edit, delete, reorder and switch between multiple sources. Three types are
 supported: **Xtream Codes** (preferred), **M3U URL**, and **local M3U file**.
@@ -197,7 +222,7 @@ still belongs where it started.
 
 ### Browse first
 
-The window opens on the catalog alone — no idle black rectangle taking a third
+The window opens on the homepage alone — no idle black rectangle taking a third
 of the width before you have played anything. Double-click a channel, a film or
 an episode and the video pane comes in beside the list; press ⏹, or let a film
 run out, and it folds away again so browsing gets the width back. It keeps
@@ -471,6 +496,7 @@ ui/
   category_tree.py      grouped sidebar
   models.py             virtualized model, poster cache, delegates
   player_widget.py      libVLC surface, operations, the up-next card
+  home_page.py          the homepage wall, rails across every kind
   search_page.py        master search across every kind
   series_page.py        series view, resume, wrapping layout
   transport_bar.py      VLC's control bar

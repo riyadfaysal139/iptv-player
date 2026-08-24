@@ -196,6 +196,21 @@ def _search(p, c):
     p.drawLine(QPointF(63, 61), QPointF(86, 84))
 
 
+def _home(p, c):
+    """A house: roof drawn as a stroked V so it reads at 19px, walls below."""
+    _stroke(p, c, 10)
+    p.drawLine(QPointF(10, 48), QPointF(50, 16))
+    p.drawLine(QPointF(50, 16), QPointF(90, 48))
+    _stroke(p, c, 9)
+    p.drawLine(QPointF(22, 46), QPointF(22, 86))
+    p.drawLine(QPointF(78, 46), QPointF(78, 86))
+    p.drawLine(QPointF(22, 86), QPointF(78, 86))
+    # The doorway, left open at the bottom so it is not a solid block.
+    p.drawLine(QPointF(42, 86), QPointF(42, 62))
+    p.drawLine(QPointF(42, 62), QPointF(58, 62))
+    p.drawLine(QPointF(58, 62), QPointF(58, 86))
+
+
 def _director(p, c):
     """A megaphone — the reference's glyph for the director row."""
     _fill(p, c)
@@ -319,6 +334,7 @@ SHAPES = {
     "audio": _audio,
     "back": _back,
     "search": _search,
+    "home": _home,
     "director": _director,
     "calendar": _calendar,
     "genre": _genre,

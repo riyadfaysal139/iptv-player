@@ -31,6 +31,7 @@ from ui import icons
 from ui.category_tree import CategoryTree, build_groups
 from ui.downloads_panel import DownloadsPanel
 from ui.effects_dialog import EffectsDialog, load_saved_effects
+from ui.home_page import HomePage, home_sections
 from ui.models import (
     ROLE_ITEM, CatalogModel, ChannelDelegate, ImageCache, PosterDelegate,
 )
@@ -244,6 +245,7 @@ class MainWindow(QMainWindow):
         # being browsed.
         self._episode_queue = []
         self._playing_series = None      # the show the current episode is from
+        self._playing_kind = None        # the kind of what is playing, not of the tab
         self._up_next = None
         self._up_next_url = ""
 
@@ -270,6 +272,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, self.first_run)
         else:
             self.reload_catalog()
+            # The front door. After reload_catalog, because building the tab
+            # puts the channel list in the pane first.
+            self.open_home()
             QTimer.singleShot(600, self.maybe_auto_sync)
 
         self._schedule_timer = QTimer(self)
@@ -325,6 +330,17 @@ class MainWindow(QMainWindow):
         self.account_label.setObjectName("statusNote")
         top_layout.addWidget(self.account_label)
         top_layout.addStretch(1)
+
+        self.home_button = QPushButton()
+        self.home_button.setObjectName("topBarButton")
+        self.home_button.setIcon(icons.icon("home", 19))
+        self.home_button.setIconSize(QSize(19, 19))
+        self.home_button.setFixedSize(34, 30)
+        self.home_button.setCursor(Qt.PointingHandCursor)
+        self.home_button.setFocusPolicy(Qt.NoFocus)
+        self.home_button.setToolTip("Home")
+        self.home_button.clicked.connect(self.open_home)
+        top_layout.addWidget(self.home_button)
 
         self.search_button = QPushButton()
         self.search_button.setObjectName("masterSearchButton")
@@ -452,6 +468,7 @@ class MainWindow(QMainWindow):
         info_layout.addLayout(buttons)
         self._build_series_page()
         self._build_search_page()
+        self._build_home_page()
 
         self.epg_box = QVBoxLayout()
         info_layout.addLayout(self.epg_box)
@@ -879,7 +896,7 @@ class MainWindow(QMainWindow):
         """
         self.stack.setCurrentWidget(widget)
         self.item_search.setVisible(
-            widget not in (self.series_page, self.search_page))
+            widget not in (self.series_page, self.search_page, self.home_page))
 
     def _schedule_item_filter(self):
         self._filter_timer.start()
@@ -989,7 +1006,14 @@ class MainWindow(QMainWindow):
         else:
             self.play_item(row)
 
-    def play_item(self, row):
+    def play_item(self, row, kind: str | None = None):
+        """`kind` is passed in when the row did not come from the open tab.
+
+        The homepage mixes all three, so reading self.kind there would request a
+        film as a live stream and file it under whatever tab happened to be
+        selected. Everywhere else the open tab *is* the kind, and the default
+        keeps that unchanged.
+        """
         if not self.playlist or not self.playlist.is_xtream:
             QMessageBox.information(
                 self, "Playback",
@@ -998,12 +1022,14 @@ class MainWindow(QMainWindow):
             return
         self._idle_timer.stop()
         self.set_player_visible(True)
+        kind = kind or self.kind
         self._current_item = row
         self._current_episode = None
         self._playing_series = None
+        self._playing_kind = kind
         client = self.client()
         stream_id, name, _, _, ext = row[0], row[1], row[2], row[3], row[4]
-        is_live = self.kind == "live"
+        is_live = kind == "live"
         url = client.url_for("live" if is_live else "movie", stream_id, ext or None)
 
         resume = 0
@@ -1011,7 +1037,7 @@ class MainWindow(QMainWindow):
             record = self.db.one(
                 "SELECT position_secs, duration_secs FROM history WHERE playlist_id=? "
                 "AND kind=? AND stream_id=? AND episode_id=''",
-                (self.playlist.id, self.kind, stream_id),
+                (self.playlist.id, kind, stream_id),
             )
             if record and record["position_secs"] > 60:
                 minutes = record["position_secs"] // 60
@@ -1029,7 +1055,7 @@ class MainWindow(QMainWindow):
         # Start the stream first; the guide fills in asynchronously behind it.
         self.player.play(self._playable_url(url), name, is_live=is_live,
                          resume_secs=resume, immediate=True)
-        self._load_epg(row)
+        self._load_epg(row, kind)
 
     def play_local(self, path: str, title: str):
         """Downloaded files play from disk and use no connection."""
@@ -1038,6 +1064,7 @@ class MainWindow(QMainWindow):
         self._current_item = None
         self._current_episode = None
         self._playing_series = None
+        self._playing_kind = None
         self.now_title.setText(title)
         self.live_badge.hide()
         self.player.play(Path(path).absolute().as_uri(), title, is_live=False)
@@ -1120,7 +1147,9 @@ class MainWindow(QMainWindow):
         if self._current_episode is not None:
             self._play_episode(self._current_episode)
         elif self._current_item is not None:
-            self.play_item(self._current_item)
+            # With the kind it was played as: a film started from the homepage
+            # while the TV tab was open would otherwise repeat as a live stream.
+            self.play_item(self._current_item, kind=self._playing_kind)
         elif self.player.current_url:
             self.player.play(self.player.current_url, self.player.current_title,
                              self.player.is_live)
@@ -1335,9 +1364,10 @@ class MainWindow(QMainWindow):
                 return None
             return ("series", str(self._playing_series[0]),
                     str(self._current_episode["episode_id"]))
-        if not self._current_item or self.kind == "live":
+        kind = self._playing_kind or self.kind
+        if not self._current_item or kind == "live":
             return None         # live has nothing to resume
-        return (self.kind, str(self._current_item[0]), "")
+        return (kind, str(self._current_item[0]), "")
 
     # ------------------------------------------------- fullscreen and PiP
 
@@ -1758,6 +1788,9 @@ class MainWindow(QMainWindow):
         if key == Qt.Key_Escape and self.search_open:
             self.close_search()
             return True
+        if key == Qt.Key_Escape and self.home_open:
+            self.close_home()
+            return True
         # Dialogs (VLSub, Effects) keep their own keyboard entirely — but the
         # test is "does another window own the focus", not "is this window
         # active". Going fullscreen leaves focusWidget() None and the window
@@ -1831,6 +1864,58 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 1500)
 
     # -------------------------------------------------------------- series
+
+    def _build_home_page(self):
+        self.home_page = HomePage(self.images)
+        self.home_page.itemActivated.connect(self._activate_home)
+        self.home_page.seeAllRequested.connect(self._see_all_rail)
+        self.stack.addWidget(self.home_page)
+
+    @property
+    def home_open(self) -> bool:
+        return self.stack.currentWidget() is self.home_page
+
+    def open_home(self):
+        """The house icon, and where the app lands."""
+        self._reveal_browser()
+        self._show_middle(self.home_page)
+        self.refresh_home()
+
+    def refresh_home(self):
+        """Rebuilt on every visit: Continue Watching moves as you watch."""
+        if self.playlist is None:
+            self.home_page.show_sections([])
+            return
+        self.home_page.show_sections(home_sections(self.db, self.playlist.id))
+
+    def close_home(self):
+        self._show_middle(self.list_view)
+        self._return_focus()
+
+    def _activate_home(self, kind: str, row):
+        """Play from the wall without being thrown off it.
+
+        The tab is deliberately *not* switched, unlike a search result: the
+        homepage is somewhere you stay. play_item() is told which kind this is
+        instead of reading it off the open tab, which is the only reason that
+        is safe - otherwise a film played from here would be requested as a
+        live stream and remembered under the wrong kind.
+        """
+        if kind == "series":
+            self._select_tab("series")
+            self.open_series(row)
+            return
+        self.play_item(row, kind=kind)
+
+    def _see_all_rail(self, target):
+        """A rail's "See all", handed to the sidebar node it corresponds to.
+
+        Every rail below the personal two is one kind and one existing node, so
+        this reuses on_node_selected rather than growing a second filter path.
+        """
+        kind, node_type, payload = target
+        self._select_tab(kind)
+        self.on_node_selected(node_type, payload)
 
     def _build_search_page(self):
         self.search_page = SearchPage(self.images)
@@ -2074,7 +2159,7 @@ class MainWindow(QMainWindow):
             if widget:
                 widget.deleteLater()
 
-    def _load_epg(self, row):
+    def _load_epg(self, row, kind: str | None = None):
         """Fetch the now/next listing without blocking the GUI.
 
         This used to be a synchronous request. Because `player.play()` only
@@ -2082,7 +2167,8 @@ class MainWindow(QMainWindow):
         duration: measured 525 ms of EPG before a single frame could start.
         """
         self._clear_epg()
-        if self.kind != "live" or not self.playlist or not self.playlist.is_xtream:
+        kind = kind or self.kind
+        if kind != "live" or not self.playlist or not self.playlist.is_xtream:
             return
         stream_id = str(row[0])
         self._epg_token = stream_id
