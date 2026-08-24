@@ -871,6 +871,62 @@ class TestPipRect(unittest.TestCase):
         self.assertGreaterEqual(self.default_width, 500)
 
 
+class TestRevealSizes(unittest.TestCase):
+    """Giving the video pane its width back.
+
+    Hiding a splitter child is not symmetric: the width goes to the items pane
+    and never returns on its own, so the reveal has to say where it comes from.
+    Pure arithmetic in ui/main_window.py, for the same reason pip_rect is.
+    """
+
+    def setUp(self):
+        from ui.main_window import (
+            MIN_LEFT_WIDTH, MIN_MIDDLE_WIDTH, PLAYER_PANE_WIDTH, reveal_sizes,
+        )
+
+        self.sizes = reveal_sizes
+        self.default = PLAYER_PANE_WIDTH
+        self.min_middle = MIN_MIDDLE_WIDTH
+        self.min_left = MIN_LEFT_WIDTH
+
+    def test_a_normal_window_gets_the_starting_layout_back(self):
+        """1500px wide, collapsed: items holds the video's width and hands it back."""
+        self.assertEqual(self.sizes([330, 1170, 0], want=510), [330, 660, 510])
+
+    def test_a_dragged_width_is_honoured(self):
+        """Drag the pane wider, stop, play again — it returns as you left it."""
+        self.assertEqual(self.sizes([330, 1170, 0], want=700), [330, 470, 700])
+
+    def test_items_keeps_its_minimum_and_categories_pays_the_rest(self):
+        left, middle, right = self.sizes([330, 400, 0], want=510)
+        self.assertEqual(middle, self.min_middle)
+        self.assertEqual(left, self.min_left)
+        # Both panes gave all they could spare, which is still short of 510.
+        self.assertEqual(right, (400 - self.min_middle) + (330 - self.min_left))
+        self.assertLess(right, 510)
+
+    def test_a_window_with_nothing_to_spare_still_returns_sane_widths(self):
+        for current in ([330, 1170, 0], [180, 260, 0], [100, 200, 0], [0, 0, 0],
+                        [180, 259, 0], [50, 900, 0]):
+            for want in (0, 120, 510, 900, 4000):
+                got = self.sizes(current, want=want)
+                self.assertEqual(len(got), 3, (current, want))
+                self.assertTrue(all(v >= 0 for v in got), (current, want, got))
+                # The total is all the width there is; it must not grow.
+                self.assertEqual(sum(got), sum(current[:2]), (current, want, got))
+
+    def test_it_never_takes_more_than_it_wants(self):
+        self.assertEqual(self.sizes([330, 1170, 0], want=200)[2], 200)
+
+    def test_the_default_width_clears_the_docked_bar(self):
+        """The bar lives in this pane and its minimum is a measured 522px.
+
+        Asking for less is not an error, it is just a lie: Qt widens the pane to
+        the minimum anyway, and the remembered width then creeps to 522.
+        """
+        self.assertGreaterEqual(self.default, 522)
+
+
 class TestMachOArches(unittest.TestCase):
     """Reading a Mach-O header to explain an architecture mismatch.
 

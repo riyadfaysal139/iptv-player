@@ -1,4 +1,9 @@
-"""Main window: three panes (categories | items | player) with TV/Movies/Series tabs."""
+"""Main window: categories | items | video, with TV/Movies/Series tabs.
+
+The video pane is not there at first. Browsing is what the window is for until
+you double-click something, so the catalog opens across the whole width and the
+player slides in beside it on play, then folds away again when playback stops.
+"""
 
 from __future__ import annotations
 
@@ -44,6 +49,13 @@ SEEK_STEP_SECONDS = 10         # VLC's short jump, on the left/right arrows
 VOLUME_STEP = 5                # matches the wheel step over the volume slider
 PIP_WIDTH = 560                # the main row of the bar needs ~490px to fit
 PIP_MARGIN = 24
+# What the splitter opens the video pane at. The docked transport bar's minimum
+# is 522px and it lives in this pane, so anything below that is silently widened
+# by Qt — measured, which is why this is not the 510 the layout used to ask for.
+PLAYER_PANE_WIDTH = 540
+MIN_MIDDLE_WIDTH = 260         # a poster column plus its scrollbar
+MIN_LEFT_WIDTH = 180           # enough for a category name
+PLAYER_HIDE_DELAY_MS = 400     # past SWITCH_DEBOUNCE_MS, so a queued switch wins
 
 
 def pip_rect(screen, width: int = PIP_WIDTH, margin: int = PIP_MARGIN):
@@ -64,6 +76,29 @@ def pip_rect(screen, width: int = PIP_WIDTH, margin: int = PIP_MARGIN):
     margin_x = min(margin, max(0, sw - width))
     margin_y = min(margin, max(0, sh - height))
     return (sx + sw - width - margin_x, sy + sh - height - margin_y, width, height)
+
+
+def reveal_sizes(current, want: int = PLAYER_PANE_WIDTH,
+                 min_middle: int = MIN_MIDDLE_WIDTH,
+                 min_left: int = MIN_LEFT_WIDTH):
+    """Splitter widths for [categories, items, video] when the video comes back.
+
+    Hiding a splitter child is not symmetric: its width goes to the items pane
+    and does not return on its own. `current` is what the splitter reports while
+    the video is collapsed, so its total is all the width there is — the video's
+    share is taken out of the items pane, the one that absorbed it, and only out
+    of the categories pane once items has given all it can spare.
+
+    Pure and free of Qt so the arithmetic can be tested without a display, the
+    same way `pip_rect` is.
+    """
+    left, middle = (max(0, int(v)) for v in current[:2])
+    want = max(0, int(want))
+    from_middle = min(want, max(0, middle - min_middle))
+    from_left = min(want - from_middle, max(0, left - min_left))
+    # A window with nothing to spare gets whatever is left rather than a clamp
+    # failure: every width stays >= 0 and the total is preserved.
+    return [left - from_left, middle - from_middle, from_middle + from_left]
 
 
 class SyncWorker(QObject):
@@ -197,6 +232,7 @@ class MainWindow(QMainWindow):
         self._cursor_hidden = False
         self._effects_dialog = None
         self._browser_sizes = None
+        self._player_width = PLAYER_PANE_WIDTH
         self._fs_overlay = None
         self._pip_state = None
         self._pip_hold_ms = 0
@@ -204,6 +240,14 @@ class MainWindow(QMainWindow):
 
         self.downloads = DownloadManager(db)
         self.downloads.start()
+
+        # Owned by the window rather than a bare QTimer.singleShot: it must die
+        # with the window, since a stop arrives during close as well. Built
+        # before the UI, which connects the player's stop signal to it.
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.setInterval(PLAYER_HIDE_DELAY_MS)
+        self._idle_timer.timeout.connect(self._hide_player_if_idle)
 
         self.setWindowTitle("IPTV Player")
         self.resize(1500, 880)
@@ -349,6 +393,7 @@ class MainWindow(QMainWindow):
 
         # ---- right: player + EPG
         right = QWidget()
+        self._right_pane = right
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
@@ -357,6 +402,7 @@ class MainWindow(QMainWindow):
         self.player.errorOccurred.connect(self._on_player_error)
         self.player.playbackStarted.connect(lambda: self.downloads.set_playback_active(True))
         self.player.playbackStopped.connect(lambda: self.downloads.set_playback_active(False))
+        self.player.playbackStopped.connect(self._idle_timer.start)
         self.player.endReached.connect(self._on_end_reached)
         self.player.positionChanged.connect(self._remember_position)
         self.player.fullscreenToggled.connect(self.toggle_fullscreen)
@@ -404,8 +450,11 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(info, 2)
         splitter.addWidget(right)
 
-        splitter.setSizes([330, 660, 510])
+        splitter.setSizes([330, 660, PLAYER_PANE_WIDTH])
         splitter.setStretchFactor(1, 1)
+        # Nothing is playing yet, so the catalog gets the whole window. Hidden
+        # after setSizes so the splitter still knows the width to open it at.
+        right.hide()
 
         self.status_progress = QProgressBar()
         self.status_progress.setMaximumWidth(180)
@@ -490,6 +539,15 @@ class MainWindow(QMainWindow):
         browser.toggled.connect(self.set_browser_visible)
         self.browser_action = browser
         view_menu.addAction(browser)
+
+        # Off until something plays: the catalog owns the window while you are
+        # browsing, which is what it is for most of the time.
+        player_pane = QAction("Video pane", self, checkable=True)
+        player_pane.setChecked(self._right_pane.isVisible())
+        player_pane.setShortcut(QKeySequence("Ctrl+Shift+V"))
+        player_pane.toggled.connect(self.set_player_visible)
+        self.player_action = player_pane
+        view_menu.addAction(player_pane)
 
         effects = QAction("Adjustments and effects…", self)
         effects.triggered.connect(self.open_effects)
@@ -904,6 +962,8 @@ class MainWindow(QMainWindow):
                 "This playlist type does not provide direct stream URLs.",
             )
             return
+        self._idle_timer.stop()
+        self.set_player_visible(True)
         self._current_item = row
         self._current_episode = None
         client = self.client()
@@ -938,6 +998,8 @@ class MainWindow(QMainWindow):
 
     def play_local(self, path: str, title: str):
         """Downloaded files play from disk and use no connection."""
+        self._idle_timer.stop()
+        self.set_player_visible(True)
         self._current_item = None
         self._current_episode = None
         self.now_title.setText(title)
@@ -1034,12 +1096,74 @@ class MainWindow(QMainWindow):
         """The bar's ☰ button — VLC's "show playlist"."""
         if self._fs_state or self._pip_state:
             return          # fullscreen and PiP own pane visibility
+        if not visible and not self.player_visible:
+            # Hiding the browser with no video pane leaves an empty window.
+            self.browser_action.setChecked(True)
+            self.statusBar().showMessage("Nothing is playing", 4000)
+            return
         if not visible and self._left_pane.isVisible():
             self._browser_sizes = self._splitter.sizes()
         self._left_pane.setVisible(visible)
         self._middle_pane.setVisible(visible)
         if visible and self._browser_sizes:
             self._splitter.setSizes(self._browser_sizes)
+
+    # -------------------------------------------------------- video pane
+
+    @property
+    def player_visible(self) -> bool:
+        return self._right_pane.isVisible()
+
+    def set_player_visible(self, visible: bool):
+        """Bring the video pane in, or fold it away again.
+
+        Called on every play, on the View menu item, and 400ms after playback
+        stops. Closing it by hand does not stop the stream — the audio carries
+        on, the way it does when a video window is minimised.
+        """
+        if self._fs_state or self._pip_state:
+            # Fullscreen and PiP own pane visibility; put the tick back where
+            # the panes actually are rather than where the menu was clicked.
+            self.player_action.setChecked(self.player_visible)
+            return
+        if visible == self.player_visible:
+            self.player_action.setChecked(visible)
+            return
+        if not visible:
+            # Remember the width it was actually dragged to, not the default.
+            self._player_width = self._splitter.sizes()[2] or self._player_width
+        self._right_pane.setVisible(visible)
+        if visible:
+            self._splitter.setSizes(
+                reveal_sizes(self._splitter.sizes(), self._player_width))
+            # Give the surface real geometry *before* libVLC draws into it: a
+            # layout applies its sizes on a posted LayoutRequest, which would
+            # otherwise not be delivered until after play() has started.
+            QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+        self.player_action.setChecked(visible)
+
+    def _return_focus(self):
+        """Hand the keyboard back to whatever is actually on screen.
+
+        The video surface is the right owner while it is showing — it is what
+        the arrow keys act on. With the pane closed it is hidden, and focusing a
+        hidden widget leaves the window with no focus widget at all: the list
+        then ignores the arrows entirely, which is exactly what happened after
+        closing the search page in a browse-only window.
+        """
+        target = self.player.surface if self.player_visible else self.list_view
+        target.setFocus(Qt.OtherFocusReason)
+
+    def _hide_player_if_idle(self):
+        """Fold the pane away once playback really has stopped.
+
+        Delayed because restart_after_error() stops and immediately replays,
+        and a queued switch waits out the player's own debounce — neither is
+        "nothing is playing", and blinking the pane away for them looks broken.
+        """
+        if self.player.current_url or self.player.pending:
+            return
+        self.set_player_visible(False)
 
     def _toggle_advanced(self, enabled: bool):
         self.db.set_setting("advanced_controls", "1" if enabled else "0")
@@ -1089,6 +1213,7 @@ class MainWindow(QMainWindow):
             "sizes": self._splitter.sizes(),
             "left": self._left_pane.isVisible(),
             "middle": self._middle_pane.isVisible(),
+            "right": self._right_pane.isVisible(),
             "info": self._info_panel.isVisible(),
             "top": self._top_bar.isVisible(),
             # On macOS the menu bar is native (not a child widget), so it has
@@ -1112,6 +1237,10 @@ class MainWindow(QMainWindow):
     def _restore_chrome(self, state: dict):
         self._left_pane.setVisible(state["left"])
         self._middle_pane.setVisible(state["middle"])
+        # Leaving fullscreen with nothing playing goes back to a browse-only
+        # window, not to an idle black pane.
+        self._right_pane.setVisible(state["right"])
+        self.player_action.setChecked(state["right"])
         self._info_panel.setVisible(state["info"])
         self._top_bar.setVisible(state["top"])
         if state["menubar"] is not None:
@@ -1143,6 +1272,7 @@ class MainWindow(QMainWindow):
         if self.search_open:
             self.close_search()
         self._fs_state = self._save_chrome()
+        self._right_pane.show()     # the video lives in it; saved state puts it back
         self._hide_chrome()
         self.showFullScreen()
         self._float_bar()
@@ -1233,7 +1363,7 @@ class MainWindow(QMainWindow):
         self._splitter.setSizes(state["sizes"])
         self._fs_state = None
         self.activateWindow()
-        self.player.surface.setFocus(Qt.OtherFocusReason)
+        self._return_focus()
 
     # ------------------------------------------------ picture-in-picture
 
@@ -1275,6 +1405,7 @@ class MainWindow(QMainWindow):
         state["handle"] = int(self.player.surface.winId())
         self._pip_state = state
 
+        self._right_pane.show()     # the video lives in it; saved state puts it back
         self._hide_chrome()
         self.player.bar.set_advanced_visible(False)
 
@@ -1324,7 +1455,7 @@ class MainWindow(QMainWindow):
         self.player.bar.set_pip(False)
         self.activateWindow()
         self.raise_()
-        self.player.surface.setFocus(Qt.OtherFocusReason)
+        self._return_focus()
 
     def _relayout(self):
         """Recompute the window's minimum size *now*, not on the next tick.
@@ -1607,7 +1738,7 @@ class MainWindow(QMainWindow):
     def close_search(self):
         self._master_timer.stop()
         self._pages.setCurrentIndex(0)
-        self.player.surface.setFocus(Qt.OtherFocusReason)
+        self._return_focus()
 
     def _schedule_master_search(self, _term=""):
         self._master_timer.start()
@@ -1668,7 +1799,7 @@ class MainWindow(QMainWindow):
 
     def close_series(self):
         self._pages.setCurrentIndex(0)
-        self.player.surface.setFocus(Qt.OtherFocusReason)
+        self._return_focus()
 
     EPISODE_COLUMNS = ("season, episode_num, episode_id, title, "
                        "container_extension, image, duration_secs")
@@ -1777,6 +1908,8 @@ class MainWindow(QMainWindow):
         # Back to the catalog page: the player lives there, and playing into a
         # hidden widget would leave you looking at the series page.
         self.close_series()
+        self._idle_timer.stop()
+        self.set_player_visible(True)
         self.player.play(url, title, is_live=False, resume_secs=int(resume_secs or 0))
 
     def _episode_menu(self, episode, position):

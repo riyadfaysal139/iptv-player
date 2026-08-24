@@ -190,6 +190,15 @@ seen — the list groups them, and the sidebar count is taken the same way the
 list is built, including dropping titles the provider has since removed from the
 catalog. Otherwise the badge says a number you cannot see on screen.
 
+### Browse first
+
+The window opens on the catalog alone — no idle black rectangle taking a third
+of the width before you have played anything. Double-click a channel, a film or
+an episode and the video pane comes in beside the list; press ⏹, or let a film
+run out, and it folds away again so browsing gets the width back. It keeps
+whatever width you dragged it to, and `View ▸ Video pane` (`Ctrl+Shift+V`)
+opens or closes it by hand without stopping the stream.
+
 ### Master search
 
 The magnifier in the top bar — or `Ctrl+F` / `Cmd+F` from anywhere, including
@@ -268,6 +277,7 @@ live channels.
 | `F` | Fullscreen · `Esc` leaves it |
 | `P` | Picture-in-Picture · `Esc` leaves it |
 | `Ctrl+L` | Show or hide the browser |
+| `Ctrl+Shift+V` | Show or hide the video pane |
 
 `Space`, `M` and the speed keys work wherever you are in the app — they are
 filtered before the channel list can swallow them, which is what makes them
@@ -280,7 +290,9 @@ channel list. Whoever has focus gets them:
   hands focus to the video, so they work straight after you press play, and
   clicking the video gets them back.
 - **The list has focus** — arrows move through channels, as before. Click the
-  list to browse.
+  list to browse. Closing a full-window page (search, a series) with no video
+  pane on screen hands the keyboard back to the list rather than to the hidden
+  video, which would leave the arrows doing nothing at all.
 - **Fullscreen or Picture-in-Picture** — always the player, since there is no
   list to compete.
 - **Typing in a search box** — always the box. `Space` inserts a space and the
@@ -423,7 +435,7 @@ core/
   vlsub.py              keyless OpenSubtitles (XML-RPC), VLSub's protocol
   vlc_setup.py          libVLC discovery and loading
 ui/
-  main_window.py        three-pane layout, tabs
+  main_window.py        pane layout, tabs, the video pane's reveal
   category_tree.py      grouped sidebar
   models.py             virtualized model, poster cache, delegates
   player_widget.py      libVLC surface and operations

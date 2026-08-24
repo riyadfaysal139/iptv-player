@@ -315,6 +315,15 @@ class PlayerWidget(QWidget):
     def is_live(self) -> bool:
         return self._is_live
 
+    @property
+    def pending(self) -> bool:
+        """A stream is queued but has not started yet.
+
+        `current_url` is only set once _start_pending runs, so on its own it
+        cannot tell "stopped" from "about to start" during the debounce.
+        """
+        return self._pending is not None
+
     def play(self, url: str, title: str = "", is_live: bool = False,
              resume_secs: int = 0, immediate: bool = True):
         """Queue a stream.
