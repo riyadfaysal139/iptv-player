@@ -1572,7 +1572,8 @@ class TestHomeCursor(unittest.TestCase):
     """Where the arrow keys land on the homepage's wall of rails."""
 
     def setUp(self):
-        from ui.home_page import FAR_END, PAGE_RAILS, move_cursor
+        from ui.gridnav import move_cursor
+        from ui.home_page import FAR_END, PAGE_RAILS
 
         self.move = move_cursor
         self.page = PAGE_RAILS
@@ -1636,6 +1637,55 @@ class TestHomeCursor(unittest.TestCase):
                                  (0, self.far), (self.page, 0)):
             self.assertIsNone(self.move([], (0, 0), d_rail, d_column))
             self.assertIsNone(self.move([0, 0], None, d_rail, d_column))
+
+
+class TestEpisodeGrid(unittest.TestCase):
+    """The wrapping grid of episode cards, as the keyboard sees it."""
+
+    def setUp(self):
+        from PySide6.QtCore import QRect
+        from ui.gridnav import move_cursor, rows_from_geometry
+
+        self.rect = QRect
+        self.rows = rows_from_geometry
+        self.move = move_cursor
+
+    def grid(self, per_row, total, width=280, height=190):
+        """Geometry FlowLayout would produce for `total` cards, `per_row` wide."""
+        out = []
+        for index in range(total):
+            row, column = divmod(index, per_row)
+            out.append(self.rect(column * width, row * height, width, height))
+        return out
+
+    def test_a_full_grid_reads_back_its_rows(self):
+        self.assertEqual(self.rows(self.grid(5, 15)), [5, 5, 5])
+
+    def test_a_short_last_row_is_counted_as_it_is(self):
+        self.assertEqual(self.rows(self.grid(5, 13)), [5, 5, 3])
+
+    def test_a_narrow_pane_wraps_sooner(self):
+        """With the video docked beside a show there may be two to a row."""
+        self.assertEqual(self.rows(self.grid(2, 7)), [2, 2, 2, 1])
+
+    def test_one_row_and_one_card(self):
+        self.assertEqual(self.rows(self.grid(5, 3)), [3])
+        self.assertEqual(self.rows(self.grid(5, 1)), [1])
+        self.assertEqual(self.rows([]), [])
+
+    def test_cards_of_differing_heights_stay_on_their_row(self):
+        """FlowLayout gives a line one y whatever the items' heights."""
+        row = [self.rect(0, 0, 280, 190), self.rect(280, 0, 280, 240),
+               self.rect(560, 0, 280, 190), self.rect(0, 240, 280, 190)]
+        self.assertEqual(self.rows(row), [3, 1])
+
+    def test_moving_down_into_a_short_last_row_clamps(self):
+        rows = self.rows(self.grid(5, 13))          # [5, 5, 3]
+        self.assertEqual(self.move(rows, (1, 4), 1, 0), (2, 2))
+
+    def test_moving_along_a_row_stops_at_its_end(self):
+        rows = self.rows(self.grid(5, 13))
+        self.assertEqual(self.move(rows, (2, 2), 0, 1), (2, 2))
 
 
 if __name__ == "__main__":

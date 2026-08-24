@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QStyle, QStyleOptionViewItem, QVBoxLayout, QWidget,
 )
 
+from ui.gridnav import move_cursor
 from ui.models import (
     POSTER_H, POSTER_W, ROLE_ITEM, ROLE_KIND, CatalogModel, PosterDelegate,
 )
@@ -269,31 +270,6 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
 # --------------------------------------------------------------------------
 # widgets
 # --------------------------------------------------------------------------
-
-
-def move_cursor(lengths, cursor, d_rail: int = 0, d_column: int = 0):
-    """Where an arrow key lands on a wall of rails `lengths` posters long.
-
-    Clamps at every edge rather than wrapping - the same choice next_episode()
-    makes, and for the same reason: running off the end of a rail should stop,
-    not silently take you somewhere else.
-
-    Empty rails are skipped, and a cursor sitting on one (its category was
-    unpinned, or the provider dropped it) is snapped to the nearest rail that
-    still has posters. Returns (rail, column), or None for an empty wall.
-    """
-    live = [i for i, n in enumerate(lengths) if n > 0]
-    if not live:
-        return None
-    rail, column = (live[0], 0) if cursor is None else cursor
-    rail = max(0, min(len(lengths) - 1, int(rail)))
-    if rail not in live:
-        rail = min(live, key=lambda i: (abs(i - rail), i))
-    if d_rail:
-        at = live.index(rail)
-        rail = live[max(0, min(len(live) - 1, at + d_rail))]
-    column = max(0, min(lengths[rail] - 1, int(column) + d_column))
-    return rail, column
 
 
 class RailDelegate(PosterDelegate):

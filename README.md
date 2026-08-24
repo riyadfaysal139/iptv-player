@@ -284,10 +284,23 @@ that is how the stored `name_folded` column is built.
 
 Opening a show gives it the items pane: its backdrop behind, the poster, and
 the provider's metadata — director, release date, genre, cast, rating and plot —
-then a row of season buttons and a wrapping grid of episode cards. The category
+then a strip of season tabs and a wrapping grid of episode cards. The category
 sidebar stays where it is, and **playing an episode keeps you on the page** —
 the video docks to the right of it instead of replacing it, so picking the next
 episode is one click, not a trip back through the grid of every show you own.
+
+**The seasons are tabs**, the same ones as TV / MOVIES / SERIES at the top of
+the window: one line that scrolls sideways rather than a block of buttons
+wrapping onto a second row — this catalog holds a twelve-season show.
+
+**The keyboard works here too.** `←` `→` walk the episode grid, `↑` `↓` move a
+row at a time, `Home`/`End` jump to the first and last episode of the season,
+and `Enter` plays the one the cursor is on — resuming it if you were part-way
+through, restarting it if you had finished. `↑` from the top row steps up onto
+the season strip, where `←` `→` change season and `↓` drops back into the grid.
+The cursor's card is outlined in yellow and the page scrolls to keep it in
+view. As everywhere else, playing something hands the keyboard to the video; a
+click on any card takes it back.
 
 **Continue watching, per show.** The page remembers the last episode you played
 and opens on its season with a **Continue S01E04 · 12 min in** button that
@@ -355,7 +368,7 @@ live channels.
 | `Space` | Play / pause · plays the next episode when the up-next card is up |
 | `←` `→` | Seek −10 s / +10 s · move along a row on the homepage |
 | `↑` `↓` | Volume −5 / +5 · move between rows on the homepage |
-| `Enter` | Play what the homepage cursor is on |
+| `Enter` | Play what the cursor is on — homepage or a show's page |
 | `M` | Mute |
 | `[` `]` | Speed down / up · `=` normal speed |
 | `Ctrl+F` | Search everything · `Esc` leaves it |
@@ -380,8 +393,9 @@ channel list. Whoever has focus gets them:
   video, which would leave the arrows doing nothing at all. The same applies
   when the video pane folds away by itself once playback stops: the keyboard
   goes back to whatever is actually on screen — the list, or the homepage wall.
-- **The homepage has focus** — arrows move the poster cursor, and `Enter` plays.
-  `Home`, `End`, `PgUp` and `PgDn` work there too.
+- **The homepage or a show's page has focus** — arrows move the poster cursor
+  or the episode cursor, and `Enter` plays. `Home` and `End` work on both;
+  `PgUp` and `PgDn` move whole rows on the homepage.
 - **Fullscreen or Picture-in-Picture** — always the player, since there is no
   list to compete.
 - **Typing in a search box** — always the box. `Space` inserts a space and the

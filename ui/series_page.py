@@ -19,15 +19,18 @@ from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLayout, QPushButton, QScrollArea,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QSizePolicy, QTabBar, QVBoxLayout, QWidget,
 )
 
 from ui import icons
+from ui.gridnav import move_cursor, rows_from_geometry
 
 POSTER_WIDTH = 260
 CARD_WIDTH = 268
 CARD_IMAGE_HEIGHT = 150
 WATCHED_FRACTION = 0.95     # past this an episode counts as finished, not resumable
+SEASON_ROW = -1             # the cursor is on the season strip, not in the grid
+FAR_END = 10 ** 6           # Home/End, expressed as a move the clamp absorbs
 
 
 # --------------------------------------------------------------------------
@@ -235,26 +238,11 @@ class MetaRow(QWidget):
         self.value.setText(text or "")
 
 
-class SeasonButton(QPushButton):
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setObjectName("seasonButton")
-        self.setCursor(Qt.PointingHandCursor)
-        self.setFocusPolicy(Qt.NoFocus)
-        self.setProperty("on", False)
-
-    def set_on(self, on: bool):
-        if self.property("on") == bool(on):
-            return
-        self.setProperty("on", bool(on))
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-
 class EpisodeCard(QFrame):
     """Poster tile for one episode, with a progress bar when partly watched."""
 
     activated = Signal(object)
+    pressed = Signal(object)                    # episode, on mouse down
     menuRequested = Signal(object, object)      # episode, global position
 
     def __init__(self, episode: dict, label: str, parent=None):
@@ -269,6 +257,10 @@ class EpisodeCard(QFrame):
                                                   self.mapToGlobal(point)))
         self._pixmap = None
         self._progress = 0.0
+        # NOT "cursor": QWidget already has a property of that name — the mouse
+        # cursor — so a dynamic one is silently swallowed and the stylesheet
+        # never matches. Measured: every card reported the property set.
+        self.setProperty("cursorOn", False)
 
         box = QVBoxLayout(self)
         box.setContentsMargins(0, 0, 0, 0)
@@ -304,6 +296,19 @@ class EpisodeCard(QFrame):
         self._progress = max(0.0, min(1.0, float(fraction or 0.0)))
         self.update()
 
+    def set_cursor_on(self, on: bool):
+        """The keyboard cursor. A QSS property, so the border is all that moves.
+
+        Unlike the homepage's posters there is no pixmap to recolour here, so
+        the stylesheet can say the whole thing — it only has to be told to look
+        again.
+        """
+        if self.property("cursorOn") == bool(on):
+            return
+        self.setProperty("cursorOn", bool(on))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
     def paintEvent(self, event):
         super().paintEvent(event)
         if self._progress <= 0:
@@ -314,6 +319,10 @@ class EpisodeCard(QFrame):
         painter.fillRect(QRect(bar.x(), bar.y(),
                                int(bar.width() * self._progress), bar.height()),
                          QColor(icons.ACCENT))
+
+    def mousePressEvent(self, event):
+        self.pressed.emit(self.episode)
+        super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         self.activated.emit(self.episode)
@@ -345,10 +354,13 @@ class SeriesPage(QWidget):
         self._cover_url = ""
         self._episodes = []
         self._history = {}
-        self._season_buttons = {}
         self._cards = []
         self._show = ""
         self._season = None
+        # (row, column) over the episode grid, or (SEASON_ROW, tab) on the
+        # season strip. None until the page has something to point at.
+        self._cursor = None
+        self.setFocusPolicy(Qt.StrongFocus)
 
         images.loaded.connect(self._image_arrived)
         self._build()
@@ -364,10 +376,15 @@ class SeriesPage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setObjectName("seriesScroll")
+        # The page owns the arrows; the scroll area must not take them, or
+        # clicking the page would leave them scrolling it instead.
+        scroll.setFocusPolicy(Qt.NoFocus)
         body = QWidget()
         body.setObjectName("seriesBody")
+        body.setFocusPolicy(Qt.NoFocus)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
+        self.scroll = scroll
 
         root = QVBoxLayout(body)
         root.setContentsMargins(28, 24, 28, 28)
@@ -426,10 +443,21 @@ class SeriesPage(QWidget):
         root.addLayout(top)
 
         # seasons ---------------------------------------------------------
-        self.season_holder = QWidget()
-        self.season_holder.setObjectName("seasonHolder")
-        self.season_row = FlowLayout(self.season_holder, margin=0, spacing=8)
-        root.addWidget(self.season_holder)
+        # A real tab bar, like TV/MOVIES/SERIES at the top: one line that
+        # scrolls rather than a block of buttons wrapping onto a second row —
+        # this catalog holds a twelve-season show.
+        self.season_tabs = QTabBar()
+        self.season_tabs.setObjectName("seasonTabs")
+        self.season_tabs.setExpanding(False)
+        self.season_tabs.setDrawBase(False)
+        self.season_tabs.setUsesScrollButtons(True)
+        # Without this a twelve-season show shows twelve tabs reading "SEAS…":
+        # the bar would rather squeeze and elide every tab than scroll.
+        self.season_tabs.setElideMode(Qt.ElideNone)
+        self.season_tabs.setFocusPolicy(Qt.NoFocus)
+        self.season_tabs.setCursor(Qt.PointingHandCursor)
+        self.season_tabs.currentChanged.connect(self._season_tab_changed)
+        root.addWidget(self.season_tabs)
 
         # episodes --------------------------------------------------------
         self.episode_holder = QWidget()
@@ -533,8 +561,12 @@ class SeriesPage(QWidget):
         self._build_seasons()
         # Open on the season the Continue button points at, not always season 1.
         seasons = self.seasons()
+        self._cursor = None
         self.show_season(episode["season"] if episode is not None
                          else (seasons[0] if seasons else 0))
+        # ...and start the keyboard on that same episode, so Enter is Continue.
+        if episode is not None:
+            self.set_cursor_to_episode(episode["episode_id"])
         self.status.setText("" if self._episodes else "No episodes listed")
 
     def seasons(self) -> list:
@@ -545,18 +577,29 @@ class SeriesPage(QWidget):
         return seen
 
     def _build_seasons(self):
-        self._clear(self.season_row)
-        self._season_buttons = {}
+        tabs = self.season_tabs
+        blocked = tabs.blockSignals(True)
+        while tabs.count():
+            tabs.removeTab(0)
         for season in self.seasons():
-            button = SeasonButton(f"Season {season}")
-            button.clicked.connect(lambda _=False, s=season: self.show_season(s))
-            self.season_row.addWidget(button)
-            self._season_buttons[season] = button
+            tabs.addTab(f"SEASON {season}")
+        tabs.blockSignals(blocked)
+
+    def _season_tab_changed(self, index: int):
+        seasons = self.seasons()
+        if 0 <= index < len(seasons):
+            self.show_season(seasons[index])
 
     def show_season(self, season: int):
         self._season = season
-        for value, button in self._season_buttons.items():
-            button.set_on(value == season)
+        seasons = self.seasons()
+        if season in seasons:
+            # Blocked, because this is also how the page follows the episode
+            # that just started playing — letting it come back through
+            # currentChanged would rebuild the grid a second time.
+            blocked = self.season_tabs.blockSignals(True)
+            self.season_tabs.setCurrentIndex(seasons.index(season))
+            self.season_tabs.blockSignals(blocked)
 
         self._clear(self.episode_grid)
         self._cards = []
@@ -568,6 +611,7 @@ class SeriesPage(QWidget):
             card = EpisodeCard(episode, label)
             card.activated.connect(self._card_activated)
             card.menuRequested.connect(self.episodeMenuRequested)
+            card.pressed.connect(self._card_pressed)
             url = episode.get("image_url") or ""
             if url:
                 card.set_pixmap(self.images.get(url))
@@ -576,6 +620,10 @@ class SeriesPage(QWidget):
             self.episode_grid.addWidget(card)
             self._cards.append(card)
         self.episode_holder.updateGeometry()
+        # Changing season from the strip itself must leave the cursor there, or
+        # the second Left/Right would act on the grid instead of the tabs.
+        self.set_cursor(self._cursor if self._cursor == SEASON_ROW else 0,
+                        scroll=False)
 
     @staticmethod
     def _clear(layout):
@@ -617,3 +665,126 @@ class SeriesPage(QWidget):
         """Follow the played episode: select its season so the page matches."""
         if episode and episode.get("season") != self._season:
             self.show_season(episode["season"])
+
+    # ----------------------------------------------------------- the cursor
+
+    def cursor_index(self):
+        """Which card the keyboard is on, SEASON_ROW for the strip, or None."""
+        return self._cursor
+
+    def cursor_episode(self):
+        if self._cursor is None or self._cursor == SEASON_ROW:
+            return None
+        if 0 <= self._cursor < len(self._cards):
+            return self._cards[self._cursor].episode
+        return None
+
+    def set_cursor(self, index, scroll: bool = True):
+        """Put the cursor on a card, on the season strip, or nowhere."""
+        if index != SEASON_ROW:
+            if not self._cards:
+                index = None
+            elif index is not None:
+                index = max(0, min(len(self._cards) - 1, int(index)))
+        self._cursor = index
+        for position, card in enumerate(self._cards):
+            card.set_cursor_on(position == index)
+        if scroll:
+            self._scroll_to_cursor()
+
+    def set_cursor_to_episode(self, episode_id):
+        for position, card in enumerate(self._cards):
+            if str(card.episode.get("episode_id")) == str(episode_id):
+                self.set_cursor(position, scroll=False)
+                return True
+        return False
+
+    def _scroll_to_cursor(self):
+        if self._cursor == SEASON_ROW:
+            self.scroll.ensureWidgetVisible(self.season_tabs, 0, 0)
+        elif self._cursor is not None and 0 <= self._cursor < len(self._cards):
+            self.scroll.ensureWidgetVisible(self._cards[self._cursor], 0, 12)
+
+    def _grid_rows(self):
+        """How the cards are wrapped right now, straight off their geometry."""
+        return rows_from_geometry([card.geometry() for card in self._cards])
+
+    def _flat(self, rows, row: int, column: int) -> int:
+        return sum(rows[:row]) + column
+
+    def _row_column(self, rows, index: int):
+        for row, count in enumerate(rows):
+            if index < count:
+                return row, index
+            index -= count
+        return (max(0, len(rows) - 1), max(0, rows[-1] - 1) if rows else 0)
+
+    def _move(self, d_row: int = 0, d_column: int = 0):
+        if self._cursor == SEASON_ROW:
+            self._move_on_seasons(d_row, d_column)
+            return
+        rows = self._grid_rows()
+        if not rows:
+            return
+        if self._cursor is None:
+            self.set_cursor(0)
+            return
+        row, column = self._row_column(rows, self._cursor)
+        if d_row < 0 and row == 0:
+            # Off the top of the grid is the season strip — which is what makes
+            # the seasons reachable without touching the mouse.
+            self.set_cursor(SEASON_ROW)
+            return
+        target = move_cursor(rows, (row, column), d_row, d_column)
+        if target is not None:
+            self.set_cursor(self._flat(rows, *target))
+
+    def _move_on_seasons(self, d_row: int, d_column: int):
+        if d_row > 0:
+            self.set_cursor(0)
+            return
+        if not d_column:
+            return
+        index = self.season_tabs.currentIndex() + (1 if d_column > 0 else -1)
+        if 0 <= index < self.season_tabs.count():
+            self.season_tabs.setCurrentIndex(index)     # drives show_season
+            self._scroll_to_cursor()
+
+    def _card_pressed(self, episode):
+        """A click puts the cursor where you clicked, and the keyboard here."""
+        self.setFocus(Qt.MouseFocusReason)
+        self.set_cursor_to_episode(episode.get("episode_id"))
+
+    def mousePressEvent(self, event):
+        self.setFocus(Qt.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        """The page's own keyboard: the seasons and the episode grid.
+
+        Space is deliberately absent — it is the global play/pause — and Esc is
+        handled by the window, which already closes the page.
+        """
+        moves = {
+            Qt.Key_Left: (0, -1), Qt.Key_Right: (0, 1),
+            Qt.Key_Up: (-1, 0), Qt.Key_Down: (1, 0),
+        }
+        key = event.key()
+        if key in moves:
+            self._move(*moves[key])
+            event.accept()
+            return
+        if key in (Qt.Key_Home, Qt.Key_End) and self._cursor != SEASON_ROW:
+            # The whole season, not the end of the line the cards happen to have
+            # wrapped onto — that boundary is an accident of the pane's width.
+            self.set_cursor(0 if key == Qt.Key_Home else FAR_END)
+            event.accept()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            if self._cursor == SEASON_ROW:
+                self.set_cursor(0)          # into the season you just picked
+            elif self._cursor is not None and 0 <= self._cursor < len(self._cards):
+                self._card_activated(self._cards[self._cursor].episode)
+            event.accept()
+            return
+        super().keyPressEvent(event)

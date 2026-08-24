@@ -1409,14 +1409,15 @@ class MainWindow(QMainWindow):
         closing the search page in a browse-only window.
 
         The list is only the right fallback when the list is what the pane is
-        showing. With the homepage up it is hidden too, and the same dead
-        keyboard follows — reachable by leaving fullscreen on the wall, or by
-        playback stopping while you are on it.
+        showing. With the homepage or a show's page up it is hidden too, and the
+        same dead keyboard follows — reachable by leaving fullscreen on the
+        wall, or by playback stopping while you are on it.
         """
+        showing = self.stack.currentWidget()
         if self.player_visible:
             target = self.player.surface
-        elif self.stack.currentWidget() is self.home_page:
-            target = self.home_page
+        elif showing in (self.home_page, self.series_page):
+            target = showing
         else:
             target = self.list_view
         target.setFocus(Qt.OtherFocusReason)
@@ -2269,6 +2270,11 @@ class MainWindow(QMainWindow):
             info["cover"] = self._current_series[2] or ""
         self.series_page.set_series(show, info, self._episode_rows(series_id),
                                     self._series_history(series_id))
+        # The episodes only just arrived, so this is where the page becomes
+        # worth pointing a keyboard at — not in open_series, which is often a
+        # loading screen while the provider is asked.
+        if not self.player_visible and self.series_open:
+            self.series_page.setFocus(Qt.OtherFocusReason)
 
     def _play_episode(self, episode, resume_secs: int = 0):
         if not episode:

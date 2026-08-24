@@ -353,19 +353,21 @@ QPushButton#continueButton {
 }
 QPushButton#continueButton:hover { background-color: #ffe533; }
 
-QPushButton#seasonButton {
-    background-color: rgba(6, 9, 28, 0.72);
-    border: 1px solid #3a4166; border-radius: 7px;
-    padding: 11px 26px; color: #ffffff; font-size: 14px;
-}
-QPushButton#seasonButton:hover { border-color: #6b74a8; }
-QPushButton#seasonButton[on="true"] { color: #f5d90a; font-weight: 700; }
+/* The seasons are a tab strip like the one at the top of the window; the plain
+   QTabBar rules above dress it. Only the backdrop showing through is new. */
+QTabBar#seasonTabs { background: transparent; }
+QTabBar#seasonTabs::tab { background: transparent; padding: 9px 18px; }
 
 QFrame#episodeCard {
     background-color: rgba(6, 9, 28, 0.72);
     border: 1px solid #3a4166; border-radius: 7px;
 }
 QFrame#episodeCard:hover { border-color: #f5d90a; }
+/* the keyboard cursor */
+QFrame#episodeCard[cursorOn="true"] {
+    border: 2px solid #f5d90a;
+    background-color: rgba(22, 32, 79, 0.85);
+}
 QLabel#episodeImage { background: transparent; border: none; }
 QLabel#episodeCaption {
     color: #ffffff; font-size: 12px; padding: 5px 6px 7px 6px;
