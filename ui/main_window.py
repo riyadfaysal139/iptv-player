@@ -6,7 +6,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QRect, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent, QObject, QRect, QSize, Qt, QThread, QTimer, Signal,
+)
 from PySide6.QtGui import QAction, QCursor, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QDialog, QHBoxLayout,
@@ -17,9 +19,10 @@ from PySide6.QtWidgets import (
 
 from core import sync as sync_mod
 from core import vlc_setup
-from core.db import Database
+from core.db import Database, fold
 from core.downloads import DownloadManager, STATUS_DONE
 from core.playlists import PlaylistStore, TYPE_XTREAM
+from ui import icons
 from ui.category_tree import CategoryTree, build_groups
 from ui.downloads_panel import DownloadsPanel
 from ui.effects_dialog import EffectsDialog, load_saved_effects
@@ -28,6 +31,7 @@ from ui.models import (
 )
 from ui.player_widget import PlayerWidget
 from ui.playlist_dialog import PlaylistEditor, PlaylistManager
+from ui.search_page import SearchPage, search_catalog
 from ui.series_page import SeriesPage
 from ui.subtitle_dialog import SubtitleDialog
 
@@ -270,6 +274,17 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.account_label)
         top_layout.addStretch(1)
 
+        self.search_button = QPushButton()
+        self.search_button.setObjectName("masterSearchButton")
+        self.search_button.setIcon(icons.icon("search", 19))
+        self.search_button.setIconSize(QSize(19, 19))
+        self.search_button.setFixedSize(34, 30)
+        self.search_button.setCursor(Qt.PointingHandCursor)
+        self.search_button.setFocusPolicy(Qt.NoFocus)
+        self.search_button.setToolTip("Search everything  (Ctrl+F)")
+        self.search_button.clicked.connect(self.open_search)
+        top_layout.addWidget(self.search_button)
+
         self.tab_bar = QTabBar()
         for _, label in TABS:
             self.tab_bar.addTab(label)
@@ -380,6 +395,7 @@ class MainWindow(QMainWindow):
         buttons.addStretch(1)
         info_layout.addLayout(buttons)
         self._build_series_page()
+        self._build_search_page()
 
         self.epg_box = QVBoxLayout()
         info_layout.addLayout(self.epg_box)
@@ -478,6 +494,11 @@ class MainWindow(QMainWindow):
         effects = QAction("Adjustments and effects…", self)
         effects.triggered.connect(self.open_effects)
         view_menu.addAction(effects)
+
+        search = QAction("Search everything…", self)
+        search.setShortcut(QKeySequence.Find)
+        search.triggered.connect(self.open_search)
+        view_menu.addAction(search)
 
         fullscreen = QAction("Fullscreen video", self)
         fullscreen.setShortcut(QKeySequence("F"))
@@ -775,7 +796,10 @@ class MainWindow(QMainWindow):
         if self.playlist is None:
             return
         node_type, payload = getattr(self, "_current_filter", ("all", None))
-        search = self.item_search.text().strip().lower()
+        # fold(), not lower(): name_folded strips accents as well as case, so a
+        # merely lowercased term misses every accented title - lower('café')
+        # matched nothing at all.
+        search = fold(self.item_search.text().strip())
         params = [self.playlist.id, self.kind]
         where = ["s.playlist_id=?", "s.kind=?"]
         joins = ""
@@ -1116,6 +1140,8 @@ class MainWindow(QMainWindow):
             self.exit_pip()
         if self.series_open:
             self.close_series()
+        if self.search_open:
+            self.close_search()
         self._fs_state = self._save_chrome()
         self._hide_chrome()
         self.showFullScreen()
@@ -1241,6 +1267,8 @@ class MainWindow(QMainWindow):
             self.exit_fullscreen()
         if self.series_open:
             self.close_series()
+        if self.search_open:
+            self.close_search()
 
         state = self._save_chrome()
         state["flags"] = self.windowFlags()
@@ -1465,6 +1493,9 @@ class MainWindow(QMainWindow):
         if key == Qt.Key_Escape and self.series_open:
             self.close_series()
             return True
+        if key == Qt.Key_Escape and self.search_open:
+            self.close_search()
+            return True
         # Dialogs (VLSub, Effects) keep their own keyboard entirely — but the
         # test is "does another window own the focus", not "is this window
         # active". Going fullscreen leaves focusWidget() None and the window
@@ -1538,6 +1569,91 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(message, 1500)
 
     # -------------------------------------------------------------- series
+
+    def _build_search_page(self):
+        self.search_page = SearchPage(self.images)
+        self.search_page.backRequested.connect(self.close_search)
+        self.search_page.resultActivated.connect(self._activate_result)
+        self.search_page.seeAllRequested.connect(self._see_all)
+        self.search_page.searchRequested.connect(self._schedule_master_search)
+        self._pages.addWidget(self.search_page)
+
+        self._master_timer = QTimer(self)
+        self._master_timer.setSingleShot(True)
+        self._master_timer.setInterval(250)
+        self._master_timer.timeout.connect(self._run_master_search)
+
+    @property
+    def search_open(self) -> bool:
+        return self._pages.currentWidget() is self.search_page
+
+    def open_search(self):
+        """The magnifier and Ctrl+F, from wherever you happen to be."""
+        if self.search_open:
+            self.search_page.focus_field()
+            return
+        # The page owns the window, so the other modes have to give it up -
+        # the same rule fullscreen, PiP and the series page already apply.
+        if self._fs_state:
+            self.exit_fullscreen()
+        if self._pip_state:
+            self.exit_pip()
+        if self.series_open:
+            self.close_series()
+        self._pages.setCurrentWidget(self.search_page)
+        self.search_page.focus_field()
+        self._run_master_search()
+
+    def close_search(self):
+        self._master_timer.stop()
+        self._pages.setCurrentIndex(0)
+        self.player.surface.setFocus(Qt.OtherFocusReason)
+
+    def _schedule_master_search(self, _term=""):
+        self._master_timer.start()
+
+    def _run_master_search(self):
+        if self.playlist is None:
+            return
+        term = self.search_page.term()
+        results = search_catalog(self.db, self.playlist.id, term)
+        self.search_page.show_results(results, term)
+
+    def _activate_result(self, kind: str, row):
+        """Play or open a result found in a section other than the current tab.
+
+        The tab is switched FIRST and deliberately: play_item() builds its URL
+        and its history record from self.kind, so a film opened while the TV tab
+        was selected would be requested as a live stream and remembered under
+        the wrong kind.
+        """
+        if kind != self.kind:
+            self._select_tab(kind)
+        if kind == "series":
+            self.open_series(row)
+        else:
+            self.close_search()
+            self.play_item(row)
+
+    def _select_tab(self, kind: str):
+        for index, (value, _label) in enumerate(TABS):
+            if value != kind:
+                continue
+            if self.tab_bar.currentIndex() != index:
+                self.tab_bar.setCurrentIndex(index)     # drives _tab_changed
+            elif self.kind != kind:
+                # Already on the tab but self.kind disagrees. Nothing should
+                # make them diverge, but self.kind is what playback builds its
+                # URL from, so re-sync rather than trust the invariant.
+                self._tab_changed(index)
+            return
+
+    def _see_all(self, kind: str, term: str):
+        """Hand the term to the tab's own filter rather than duplicating it."""
+        self._select_tab(kind)
+        self.close_search()
+        self.item_search.setText(term)
+        self.apply_item_filter()
 
     def _build_series_page(self):
         self.series_page = SeriesPage(self.images)
@@ -1968,6 +2084,8 @@ class MainWindow(QMainWindow):
             self.exit_fullscreen()
         if self._pip_state:
             self.exit_pip()
+        if self.search_open:
+            self.close_search()
         if self._effects_dialog is not None:
             self._effects_dialog.close()
         ThreadedTask.drain()

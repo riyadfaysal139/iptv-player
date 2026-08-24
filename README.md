@@ -190,6 +190,24 @@ seen — the list groups them, and the sidebar count is taken the same way the
 list is built, including dropping titles the provider has since removed from the
 catalog. Otherwise the badge says a number you cannot see on screen.
 
+### Master search
+
+The magnifier in the top bar — or `Ctrl+F` / `Cmd+F` from anywhere, including
+fullscreen and Picture-in-Picture — searches **TV, Movies and Series at once**,
+so you do not have to guess which tab a title was filed under. Results appear
+grouped by type in the layout each one normally uses: channel rows with logos
+for TV, poster cells for films and shows. **See all in MOVIES** hands the term
+to that tab's own filter when a section has more than it shows.
+
+Each section is capped, and the cap is not cosmetic. `name_folded` has no index
+a leading-wildcard `LIKE` can use, so a search is a scan of ~93,000 rows; the
+per-section limit lets SQLite stop early, which is the difference between
+**0.2 ms and 190 ms** on a single common letter. Terms shorter than two
+characters are refused for the same reason.
+
+Search terms are folded, not merely lowercased — `cafe` finds `Café`, because
+that is how the stored `name_folded` column is built.
+
 ### Series
 
 Opening a show gives it the whole window: its backdrop behind, the poster, and
@@ -246,6 +264,7 @@ live channels.
 | `↑` `↓` | Volume −5 / +5 |
 | `M` | Mute |
 | `[` `]` | Speed down / up · `=` normal speed |
+| `Ctrl+F` | Search everything · `Esc` leaves it |
 | `F` | Fullscreen · `Esc` leaves it |
 | `P` | Picture-in-Picture · `Esc` leaves it |
 | `Ctrl+L` | Show or hide the browser |
@@ -408,6 +427,7 @@ ui/
   category_tree.py      grouped sidebar
   models.py             virtualized model, poster cache, delegates
   player_widget.py      libVLC surface and operations
+  search_page.py        master search across every kind
   series_page.py        full-window series view, resume, wrapping layout
   transport_bar.py      VLC's control bar
   effects_dialog.py     equalizer and video adjustments

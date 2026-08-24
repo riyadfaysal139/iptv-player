@@ -302,3 +302,33 @@ QLabel#episodeCaption {
     color: #ffffff; font-size: 12px; padding: 5px 6px 7px 6px;
     background: transparent;
 }
+
+/* ---------- master search ---------- */
+QPushButton#masterSearchButton {
+    background: transparent; border: none; border-radius: 6px;
+}
+QPushButton#masterSearchButton:hover { background-color: #101841; }
+
+QWidget#searchPage, QWidget#searchBody, QScrollArea#searchScroll,
+QScrollArea#searchScroll > QWidget > QWidget,
+QWidget#resultSection { background-color: #070b22; }
+
+QLineEdit#masterSearch {
+    font-size: 18px; padding: 11px 14px;
+    background-color: #0d1330; border: 1px solid #253166; border-radius: 7px;
+}
+QLineEdit#masterSearch:focus { border: 1px solid #f5d90a; }
+
+QLabel#sectionHeading {
+    color: #8e97c4; font-size: 13px; font-weight: 700;
+    letter-spacing: 1px;
+}
+QLabel#searchStatus { color: #9aa3cd; font-size: 14px; }
+
+QPushButton#seeAllButton {
+    background: transparent; border: none;
+    color: #f5d90a; font-size: 12px; padding: 2px 4px;
+}
+QPushButton#seeAllButton:hover { text-decoration: underline; }
+
+QWidget#resultSection QListView { background-color: #070b22; border: none; }

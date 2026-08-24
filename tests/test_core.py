@@ -606,6 +606,116 @@ class TestResumePick(unittest.TestCase):
         self.assertEqual(self.describe(self.episodes[0], 5), "Play S01E01")
 
 
+class TestMasterSearch(unittest.TestCase):
+    """Searching the whole catalog at once, not just the open tab."""
+
+    def setUp(self):
+        import tempfile
+
+        from ui.search_page import search_catalog
+
+        self.search = search_catalog
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = Database(self.dir / "t.sqlite")
+        self.db.execute(
+            "INSERT INTO playlists(id, name, type, position) VALUES(1,'p','xtream',0)")
+        # The same title filed under all three kinds.
+        for kind, stream_id in (("live", "1"), ("movie", "2"), ("series", "3")):
+            self.add(kind, stream_id, "Trailer Park Boys")
+
+    def add(self, kind, stream_id, name, available=1, dup_rank=1):
+        self.db.execute(
+            "INSERT INTO streams(playlist_id, kind, stream_id, name, name_folded,"
+            " available, dup_rank) VALUES(1,?,?,?,?,?,?)",
+            (kind, stream_id, name, fold(name), available, dup_rank),
+        )
+
+    def tearDown(self):
+        import shutil
+
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def names(self, results, kind):
+        return [row[1] for row in results[kind][0]]
+
+    def test_one_call_reaches_every_kind(self):
+        results = self.search(self.db, 1, "trailer")
+        for kind in ("live", "movie", "series"):
+            self.assertEqual(self.names(results, kind), ["Trailer Park Boys"], kind)
+
+    def test_accents_are_folded_not_just_lowercased(self):
+        """lower('café') matches nothing; the folded column needs a folded term."""
+        self.add("movie", "9", "Café Society")
+        self.assertEqual(self.names(self.search(self.db, 1, "cafe"), "movie"),
+                         ["Café Society"])
+        self.assertEqual(self.names(self.search(self.db, 1, "café"), "movie"),
+                         ["Café Society"])
+
+    def test_results_are_capped_and_report_truncation(self):
+        for index in range(30):
+            self.add("movie", f"m{index}", f"Park Number {index:02d}")
+        rows, truncated = self.search(self.db, 1, "park")["movie"]
+        self.assertEqual(len(rows), 18)
+        self.assertTrue(truncated)
+
+    def test_a_short_result_set_is_not_marked_truncated(self):
+        rows, truncated = self.search(self.db, 1, "trailer")["movie"]
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(truncated)
+
+    def test_a_custom_cap_is_honoured(self):
+        for index in range(10):
+            self.add("live", f"c{index}", f"Park Channel {index}")
+        rows, truncated = self.search(self.db, 1, "park", caps={"live": 3})["live"]
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(truncated)
+
+    def test_withdrawn_nameless_and_duplicate_rows_stay_out(self):
+        self.add("movie", "d1", "Park Gone", available=0)
+        self.add("movie", "d2", "", available=1)
+        # dup_rank>1 is the sync-time marker for the same title in another
+        # category; without excluding it one film lists several times.
+        self.add("movie", "d3", "Park Duplicate", dup_rank=2)
+        names = self.names(self.search(self.db, 1, "park"), "movie")
+        self.assertNotIn("Park Gone", names)
+        self.assertNotIn("Park Duplicate", names)
+        self.assertNotIn("", names)
+
+    def test_a_term_too_short_to_be_worth_scanning_returns_nothing(self):
+        for term in ("", " ", "t", "  a "):
+            results = self.search(self.db, 1, term)
+            self.assertEqual(sum(len(r) for r, _ in results.values()), 0, repr(term))
+
+    def test_no_match_gives_empty_sections_rather_than_an_error(self):
+        results = self.search(self.db, 1, "nothinglikethis")
+        self.assertEqual(set(results), {"live", "movie", "series"})
+        self.assertEqual(sum(len(r) for r, _ in results.values()), 0)
+
+    def test_another_playlists_rows_are_not_returned(self):
+        self.db.execute(
+            "INSERT INTO playlists(id, name, type, position) VALUES(2,'q','xtream',1)")
+        self.db.execute(
+            "INSERT INTO streams(playlist_id, kind, stream_id, name, name_folded,"
+            " available, dup_rank) VALUES(2,'movie','x','Trailer Other','trailer other',1,1)")
+        self.assertEqual(self.names(self.search(self.db, 1, "trailer"), "movie"),
+                         ["Trailer Park Boys"])
+
+    def test_rows_match_the_shape_the_catalog_model_expects(self):
+        from ui.models import CatalogModel
+
+        rows = self.search(self.db, 1, "trailer")["movie"][0]
+        self.assertEqual(len(rows[0]), len(CatalogModel.FIELDS))
+        self.assertEqual(rows[0][1], "Trailer Park Boys")
+
+    def test_live_results_keep_the_providers_running_order(self):
+        self.db.execute("UPDATE streams SET num=7 WHERE kind='live'")
+        self.add("live", "20", "Park Extra")
+        self.db.execute("UPDATE streams SET num=2 WHERE stream_id='20'")
+        self.assertEqual(self.names(self.search(self.db, 1, "park"), "live"),
+                         ["Park Extra", "Trailer Park Boys"])
+
+
 class TestFlowLayout(unittest.TestCase):
     """Episode cards wrap instead of scrolling sideways.
 

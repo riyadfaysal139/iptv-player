@@ -189,6 +189,13 @@ def _back(p, c):
     _arrow_head(p, (16, 50), (46, 50), spread=30.0)
 
 
+def _search(p, c):
+    _stroke(p, c, 10)
+    p.drawEllipse(QPointF(44, 42), 26, 26)
+    _stroke(p, c, 12, Qt.RoundCap)
+    p.drawLine(QPointF(63, 61), QPointF(86, 84))
+
+
 def _director(p, c):
     """A megaphone — the reference's glyph for the director row."""
     _fill(p, c)
@@ -311,6 +318,7 @@ SHAPES = {
     "subtitles": _subtitles,
     "audio": _audio,
     "back": _back,
+    "search": _search,
     "director": _director,
     "calendar": _calendar,
     "genre": _genre,
