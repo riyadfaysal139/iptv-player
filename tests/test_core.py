@@ -1804,6 +1804,124 @@ class TestHomeOrder(unittest.TestCase):
         self.assertLess(keys.index("cat_movie_c1"), keys.index("cat_movie_c2"))
 
 
+class TestMoreSections(unittest.TestCase):
+    """Paging the wall: what arrives when you keep scrolling down."""
+
+    def setUp(self):
+        import tempfile
+        import time
+
+        from ui.home_page import MIN_RAIL, home_sections, more_sections
+
+        self.build = home_sections
+        self.more = more_sections
+        self.min_rail = MIN_RAIL
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = Database(self.dir / "t.sqlite")
+        self.db.execute(
+            "INSERT INTO playlists(id, name, type, position) VALUES(1,'p','xtream',0)")
+        self.now = int(time.time())
+
+    def tearDown(self):
+        import shutil
+
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def category(self, kind, category_id, name, group, count, items):
+        self.db.execute(
+            "INSERT INTO categories(playlist_id, kind, category_id, name,"
+            " group_name, sub_name, item_count) VALUES(1,?,?,?,?,?,?)",
+            (kind, category_id, name, group, name, count),
+        )
+        for n in range(items):
+            self.db.execute(
+                "INSERT INTO streams(playlist_id, kind, stream_id, name,"
+                " name_folded, available, dup_rank, category_id, added)"
+                " VALUES(1,?,?,?,?,1,1,?,?)",
+                (kind, f"{category_id}-{n}", f"{name} {n}",
+                 fold(f"{name} {n}"), category_id, self.now),
+            )
+
+    def stock(self, how_many=12, items=8):
+        for index in range(how_many):
+            self.category("movie", f"c{index}", f"Cat{index}", "Genres",
+                          count=1000 - index, items=items)
+
+    def keys(self, sections):
+        return [key for key, _t, _r, _k, _ta in sections]
+
+    def test_a_page_arrives_biggest_first(self):
+        self.stock()
+        page, offset = self.more(self.db, 1, set(), count=4)
+        self.assertEqual(self.keys(page),
+                         ["cat_movie_c0", "cat_movie_c1", "cat_movie_c2",
+                          "cat_movie_c3"])
+        self.assertEqual(offset, 4)
+
+    def test_the_next_page_carries_on_where_the_last_stopped(self):
+        self.stock()
+        first, offset = self.more(self.db, 1, set(), count=4)
+        second, offset = self.more(self.db, 1, set(self.keys(first)), count=4,
+                                   offset=offset)
+        self.assertEqual(self.keys(second),
+                         ["cat_movie_c4", "cat_movie_c5", "cat_movie_c6",
+                          "cat_movie_c7"])
+        self.assertFalse(set(self.keys(first)) & set(self.keys(second)))
+
+    def test_it_never_repeats_what_is_already_on_the_wall(self):
+        self.stock()
+        on_wall = self.keys(self.build(self.db, 1))
+        page, _ = self.more(self.db, 1, set(on_wall), count=4)
+        self.assertFalse(set(self.keys(page)) & set(on_wall), str(self.keys(page)))
+
+    def test_a_page_that_skips_seen_rows_still_resumes_correctly(self):
+        """offset counts categories examined, not rows returned."""
+        self.stock()
+        seen = {"cat_movie_c0", "cat_movie_c1"}
+        page, offset = self.more(self.db, 1, set(seen), count=2)
+        self.assertEqual(self.keys(page), ["cat_movie_c2", "cat_movie_c3"])
+        self.assertEqual(offset, 4)
+        seen |= set(self.keys(page))
+        page, _ = self.more(self.db, 1, seen, count=2, offset=offset)
+        self.assertEqual(self.keys(page), ["cat_movie_c4", "cat_movie_c5"])
+
+    def test_the_end_of_the_catalog_is_an_empty_page(self):
+        self.stock(how_many=3)
+        page, offset = self.more(self.db, 1, set(), count=4)
+        self.assertEqual(len(page), 3)
+        page, _ = self.more(self.db, 1, set(self.keys(page)), count=4, offset=offset)
+        self.assertEqual(page, [])
+
+    def test_no_catalog_at_all_is_an_empty_page_rather_than_an_error(self):
+        self.assertEqual(self.more(self.db, 1, set(), count=4), ([], 0))
+
+    def test_a_category_too_small_to_fill_a_row_never_arrives(self):
+        self.stock(how_many=2)
+        self.category("movie", "tiny", "Tiny", "Genres", count=900, items=2)
+        page, _ = self.more(self.db, 1, set(), count=8)
+        self.assertNotIn("cat_movie_tiny", self.keys(page))
+
+    def test_a_category_the_provider_counts_but_has_no_rows_for_is_skipped(self):
+        """item_count is the provider's word for it; the rows are the truth."""
+        self.stock(how_many=2)
+        self.category("movie", "empty", "Empty", "Genres", count=5000, items=0)
+        page, _ = self.more(self.db, 1, set(), count=4)
+        self.assertNotIn("cat_movie_empty", self.keys(page))
+        self.assertEqual(len(page), 2)
+
+    def test_paging_the_whole_catalog_visits_each_category_once(self):
+        self.stock(how_many=9)
+        seen, offset, out = set(), 0, []
+        for _ in range(10):
+            page, offset = self.more(self.db, 1, seen, count=2, offset=offset)
+            if not page:
+                break
+            out += self.keys(page)
+        self.assertEqual(len(out), 9)
+        self.assertEqual(len(set(out)), 9)
+
+
 class TestEpisodeGrid(unittest.TestCase):
     """The wrapping grid of episode cards, as the keyboard sees it."""
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, Signal
+from PySide6.QtCore import QModelIndex, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QHBoxLayout, QLabel, QListView, QPushButton,
@@ -29,8 +29,14 @@ from ui.models import (
 ROW_CAP = 20            # posters per rail
 GENRE_ROWS = 5          # how many of the provider's genres get a rail
 MIN_RAIL = 6            # below this it is not a row, it is a gap
-MAX_RAILS = 11          # a wall you scroll, not one you get lost in
+MAX_RAILS = 11          # the first page: a wall you scroll, not one you get lost in
 RECENT_DAYS = 30
+
+# Scrolling to the bottom fetches more of the wall.
+PAGE_SIZE = 4           # rows per page
+PAGE_SCAN = 24          # categories looked at per query while filling a page
+MAX_TOTAL_RAILS = 50    # a very long scroll still has to end somewhere
+LOAD_MARGIN = 700       # pixels from the bottom at which the next page is asked for
 
 # The keyboard cursor's poster is drawn this much larger, into a halo of empty
 # space every cell reserves. GROW_X/GROW_Y are sized so the scaled paint still
@@ -197,6 +203,60 @@ def _genres(db, playlist_id, limit):
     )]
 
 
+def more_sections(db, playlist_id, seen, count: int = PAGE_SIZE, offset: int = 0,
+                  cap: int = ROW_CAP):
+    """The next page of the wall, and where to carry on from.
+
+    The provider's own categories, biggest first, minus whatever is already on
+    the wall - this catalog holds 384 of them with six or more titles, so there
+    is far more wall than the first page shows.
+
+    `offset` counts categories *examined*, not rows returned, so a page that
+    skips several already-shown categories still resumes in the right place.
+    """
+    out = []
+    # Your own arrangement first: the first page shows as much of it as fits,
+    # and the rest of it arrives in order as you scroll, before anything the
+    # app picked. Materialising all fifty at once costs a second of widget
+    # building — measured — which is why it is paged like everything else.
+    for key in saved_order(db, playlist_id):
+        if len(out) >= count:
+            return out, offset
+        if key in seen:
+            continue
+        section = section_for_key(db, playlist_id, key, cap)
+        if section is None:
+            continue
+        out.append(section)
+        seen.add(key)
+
+    while len(out) < count:
+        rows = db.query(
+            "SELECT kind, category_id FROM categories WHERE playlist_id=?"
+            " AND item_count >= ?"
+            # A deterministic tiebreak, or paging over equal counts with OFFSET
+            # would show some categories twice and skip others.
+            " ORDER BY item_count DESC, kind, category_id LIMIT ? OFFSET ?",
+            (playlist_id, MIN_RAIL, PAGE_SCAN, int(offset)),
+        )
+        if not rows:
+            return out, offset          # the catalog has run out
+        for row in rows:
+            offset += 1
+            key = f"cat_{row['kind']}_{row['category_id']}"
+            if key in seen:
+                continue
+            section = _category_section(db, playlist_id, row["kind"],
+                                        row["category_id"], cap)
+            if section is None:
+                continue
+            out.append(section)
+            seen.add(key)
+            if len(out) >= count:
+                break
+    return out, offset
+
+
 def _headline(kind: str, name: str) -> str:
     """One heading rule for every category row.
 
@@ -314,6 +374,11 @@ def section_for_key(db, playlist_id, key: str, cap: int = ROW_CAP):
     return None
 
 
+def _always_shown(key: str) -> bool:
+    """Rows the caps never trim: your history and the ones you pinned."""
+    return key in ("continue", "favourites") or key.startswith("pin_")
+
+
 def apply_order(sections, order):
     """Sort the wall by a saved order, keeping unsaved rows where they belong.
 
@@ -391,8 +456,7 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
 
     # Your history and your pins always stay: the cap exists to trim what the
     # app guessed, never what you asked for.
-    keep = [s for s in out
-            if s[0] in ("continue", "favourites") or s[0].startswith("pin_")]
+    keep = [s for s in out if _always_shown(s[0])]
     generated = [s for s in out if s not in keep]
     out = keep + generated[:max(0, MAX_RAILS - len(keep))]
 
@@ -403,14 +467,20 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
     if not order:
         return out
     present = {s[0] for s in out}
-    for key in order:
+    for key in order[:MAX_RAILS]:
         if key in present:
             continue
         section = section_for_key(db, playlist_id, key, cap)
         if section is not None:
             out.append(section)
             present.add(key)
-    return apply_order(out, order)
+    ordered = apply_order(out, order)
+
+    # The page stays a page, however deep the arrangement goes: the rest of it
+    # arrives as you scroll. Your history and your pins are the exception, as
+    # they are for the cap - they are never left off the first page.
+    page = ordered[:MAX_RAILS]
+    return page + [s for s in ordered[MAX_RAILS:] if _always_shown(s[0])]
 
 
 # --------------------------------------------------------------------------
@@ -600,6 +670,7 @@ class HomePage(QWidget):
     seeAllRequested = Signal(object)         # (kind, node_type, payload)
     unpinRequested = Signal(object)          # (kind, node_type, payload)
     moveRequested = Signal(str, int)         # rail key, -1 up / +1 down
+    moreRequested = Signal()                 # the bottom of the wall is in sight
 
     def __init__(self, images, parent=None):
         super().__init__(parent)
@@ -611,6 +682,8 @@ class HomePage(QWidget):
         # key itself is gone by the next rebuild.
         self._cursor = None
         self._cursor_row = 0
+        self._loading = False
+        self._exhausted = False
         # The page owns the arrows; the scroll area must not take them, or
         # clicking the wall would leave them scrolling it instead.
         self.setFocusPolicy(Qt.StrongFocus)
@@ -633,6 +706,8 @@ class HomePage(QWidget):
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
         self.scroll = scroll
+        scroll.verticalScrollBar().valueChanged.connect(
+            lambda _value: self.request_more())
 
         self.root = QVBoxLayout(body)
         self.root.setContentsMargins(24, 20, 24, 28)
@@ -646,8 +721,12 @@ class HomePage(QWidget):
         self.root.addWidget(self.empty)
         self.root.addStretch(1)
 
-    def show_sections(self, sections):
-        """Replace the wall. Rails are reused across refreshes by key."""
+    def show_sections(self, sections, keep_scroll: bool = False):
+        """Replace the wall. Rails are reused across refreshes by key.
+
+        `keep_scroll` for a change made in place - a row moved, a pin added -
+        where yanking the view to the top would lose what you were looking at.
+        """
         wanted = [key for key, _, _, _, _ in sections]
         for key in list(self.rails):
             if key not in wanted:
@@ -655,7 +734,40 @@ class HomePage(QWidget):
                 self.root.removeWidget(rail)
                 rail.deleteLater()
 
-        for position, (key, title, rows, kinds, target) in enumerate(sections):
+        self._order = []
+        self._loading = False
+        self._exhausted = False
+        # A shorter wall clamps the scroll bar to its new bottom, which reads as
+        # "the bottom is in sight" and quietly fetched another page on every
+        # visit. Nothing is asked for until the rebuild has settled.
+        self._suspend_more = True
+        QTimer.singleShot(0, self._resume_more)
+        self._place(sections)
+        if not keep_scroll:
+            self.scroll.verticalScrollBar().setValue(0)
+        self.empty.setVisible(not sections)
+        if not sections:
+            self.empty.setText(
+                "Nothing to show yet.\n\nOnce the catalog has been fetched, what "
+                "you watch and what you favourite turn up here."
+            )
+        # Setting a model's rows drops its selection, and the wall is rebuilt on
+        # every visit, so the cursor has to be put back rather than reset - or
+        # opening the homepage would throw you to the top-left each time.
+        self._apply_cursor()
+
+    def append_sections(self, sections):
+        """Add a page to the bottom of the wall, keeping what is already there."""
+        fresh = [s for s in sections if s[0] not in self.rails]
+        self._place(fresh)
+        self._loading = False
+        if not fresh:
+            self._exhausted = True
+        self._apply_cursor()
+
+    def _place(self, sections):
+        """Build or reuse a rail per section and put them after what is there."""
+        for key, title, rows, kinds, target in sections:
             rail = self.rails.get(key)
             if rail is None:
                 rail = HomeRail(key, title, self.images)
@@ -669,24 +781,68 @@ class HomePage(QWidget):
             rail.set_target(target, pinned=key.startswith("pin_"))
             rail.set_rows(rows, kinds)
             # Insert before the trailing stretch, in the order given.
-            self.root.insertWidget(position + 1, rail)
+            self.root.insertWidget(len(self._order) + 1, rail)
+            self._order.append(key)
+        self._sync_move_buttons()
 
-        self._order = wanted
-        for position, key in enumerate(wanted):
+    def _resume_more(self):
+        """The rebuild has settled; a real scroll to the bottom counts again."""
+        self._suspend_more = False
+
+    def move_row(self, key: str, delta: int) -> bool:
+        """Swap a row with its neighbour, in place. True when it moved.
+
+        In place rather than through a rebuild: a rebuild drops the wall back
+        to its first page, so a row you were moving up from page three vanished
+        under you after a single step.
+        """
+        if key not in self._order:
+            return False
+        here = self._order.index(key)
+        there = here + (1 if delta > 0 else -1)
+        if not 0 <= there < len(self._order):
+            return False
+        self._order[here], self._order[there] = (self._order[there],
+                                                 self._order[here])
+        for position in (min(here, there), max(here, there)):
+            # insertWidget moves a widget it already owns.
+            self.root.insertWidget(position + 1, self.rails[self._order[position]])
+        self._sync_move_buttons()
+        self.scroll.ensureWidgetVisible(self.rails[key], 0, 0)
+        return True
+
+    def _sync_move_buttons(self):
+        for position, key in enumerate(self._order):
             # Nothing to move past at the ends of the wall.
             rail = self.rails[key]
             rail.move_up.setEnabled(position > 0)
-            rail.move_down.setEnabled(position < len(wanted) - 1)
-        self.empty.setVisible(not sections)
-        if not sections:
-            self.empty.setText(
-                "Nothing to show yet.\n\nOnce the catalog has been fetched, what "
-                "you watch and what you favourite turn up here."
-            )
-        # Setting a model's rows drops its selection, and the wall is rebuilt on
-        # every visit, so the cursor has to be put back rather than reset - or
-        # opening the homepage would throw you to the top-left each time.
-        self._apply_cursor()
+            rail.move_down.setEnabled(position < len(self._order) - 1)
+
+    def loading_more(self) -> bool:
+        return self._loading
+
+    def exhausted(self) -> bool:
+        return self._exhausted
+
+    def request_more(self, force: bool = False):
+        """Ask for the next page when the bottom of the wall is in sight.
+
+        Guarded three ways: one request at a time, nothing once the catalog has
+        run out, and a ceiling on the whole wall - the rails are real views, and
+        a very long scroll still has to end somewhere.
+        """
+        if self._loading or self._exhausted or self._suspend_more:
+            return
+        if not self._order:
+            return
+        if len(self._order) >= MAX_TOTAL_RAILS:
+            self._exhausted = True
+            return
+        bar = self.scroll.verticalScrollBar()
+        if not force and bar.value() < bar.maximum() - LOAD_MARGIN:
+            return
+        self._loading = True
+        self.moreRequested.emit()
 
     def rail_keys(self):
         return list(self._order)
@@ -723,6 +879,10 @@ class HomePage(QWidget):
             return
         self._cursor = (keys[target[0]], target[1])
         self._apply_cursor(scroll=True)
+        if d_rail > 0 and target[0] == len(keys) - 1:
+            # Down at the bottom row: the keyboard reaches the same wall the
+            # mouse does rather than stopping at the end of the loaded page.
+            self.request_more(force=True)
 
     def _apply_cursor(self, scroll: bool = False):
         keys = self._keys()

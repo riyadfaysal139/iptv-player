@@ -200,6 +200,15 @@ one tab's catalog — steps aside and gives the wall the full width. Clicking an
 tab brings all three back, **including the tab already selected**: it is where
 you would land, so it has to work.
 
+**It keeps going.** The first page is eleven rows; scroll to the bottom and the
+next few arrive — the provider's own categories, biggest first, minus whatever
+is already on the wall. This catalog has 384 of them with six or more titles, so
+there is a great deal more wall than the first screen shows. `↓` on the last row
+fetches the next page too, so the keyboard reaches the same wall the mouse does.
+A page costs about 120 ms to build, one indexed query per row, and the whole
+thing stops at fifty rows. Re-opening the homepage starts again at the first
+page: a cheap, predictable open beats restoring a deep scroll.
+
 **Arrange it yourself.** Every row carries **▲ ▼** beside its heading; one click
 moves it past its neighbour, and `Ctrl+↑` / `Ctrl+↓` do the same to the row the
 cursor is on. The arrangement is remembered per playlist, and the whole visible

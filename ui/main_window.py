@@ -32,8 +32,8 @@ from ui.category_tree import CategoryTree, build_groups
 from ui.downloads_panel import DownloadsPanel
 from ui.effects_dialog import EffectsDialog, load_saved_effects
 from ui.home_page import (
-    HomePage, home_sections, is_pinned, pin_keys, pin_rail, save_order,
-    unpin_rail,
+    MAX_TOTAL_RAILS, PAGE_SIZE, HomePage, home_sections, is_pinned,
+    more_sections, pin_keys, pin_rail, save_order, unpin_rail,
 )
 from ui.models import (
     ROLE_ITEM, CatalogModel, ChannelDelegate, ImageCache, PosterDelegate,
@@ -1987,6 +1987,8 @@ class MainWindow(QMainWindow):
         self.home_page.seeAllRequested.connect(self._see_all_rail)
         self.home_page.unpinRequested.connect(self._unpin_rail)
         self.home_page.moveRequested.connect(self.move_rail)
+        self.home_page.moreRequested.connect(self._load_more_home)
+        self._home_offset = 0
         self.stack.addWidget(self.home_page)
 
     @property
@@ -2005,12 +2007,34 @@ class MainWindow(QMainWindow):
         self.refresh_home()
         self.home_page.setFocus(Qt.OtherFocusReason)
 
-    def refresh_home(self):
-        """Rebuilt on every visit: Continue Watching moves as you watch."""
+    def refresh_home(self, keep_scroll: bool = False):
+        """Rebuilt on every visit: Continue Watching moves as you watch.
+
+        Back to the first page, too. The wall is rebuilt each time it is opened
+        anyway, and a cheap, predictable open beats restoring a deep scroll.
+        `keep_scroll` is for a change made in place — a row moved, a pin taken
+        off — where jumping to the top would lose what you were looking at.
+        """
+        self._home_offset = 0
         if self.playlist is None:
             self.home_page.show_sections([])
             return
-        self.home_page.show_sections(home_sections(self.db, self.playlist.id))
+        self.home_page.show_sections(home_sections(self.db, self.playlist.id),
+                                     keep_scroll=keep_scroll)
+
+    def _load_more_home(self):
+        """The next page of rows, once the bottom of the wall is in sight."""
+        keys = self.home_page.rail_keys()
+        # The ceiling is checked here as well as before the request, because a
+        # page of four asked for at forty-seven would sail past it.
+        count = min(PAGE_SIZE, MAX_TOTAL_RAILS - len(keys))
+        if self.playlist is None or count <= 0:
+            self.home_page.append_sections([])
+            return
+        sections, self._home_offset = more_sections(
+            self.db, self.playlist.id, set(keys), count=count,
+            offset=self._home_offset)
+        self.home_page.append_sections(sections)
 
     def close_home(self):
         self._show_middle(self.list_view)
@@ -2058,19 +2082,9 @@ class MainWindow(QMainWindow):
         the rule is simply "what you see is what is saved" — and a row that
         turns up later still lands where the app would have put it.
         """
-        if self.playlist is None:
-            return
-        keys = self.home_page.rail_keys()
-        if key not in keys:
-            return
-        position = keys.index(key)
-        target = position + (1 if delta > 0 else -1)
-        if not 0 <= target < len(keys):
+        if self.playlist is None or not self.home_page.move_row(key, delta):
             return              # nothing to move past at the ends of the wall
-        keys[position], keys[target] = keys[target], keys[position]
-        save_order(self.db, self.playlist.id, keys)
-        self.refresh_home()
-        self.home_page.ensure_visible()
+        save_order(self.db, self.playlist.id, self.home_page.rail_keys())
         self.statusBar().showMessage(
             f"Moved “{self.home_page.rail_title(key)}” "
             f"{'down' if delta > 0 else 'up'}", 3000)
@@ -2089,7 +2103,7 @@ class MainWindow(QMainWindow):
             return
         self.tree.set_home_pins(pin_keys(self.db, self.playlist.id), self.kind)
         if self.home_open:
-            self.refresh_home()
+            self.refresh_home(keep_scroll=True)
 
     def _category_menu(self, node_type: str, payload, title: str, position):
         menu = QMenu(self)
