@@ -197,8 +197,161 @@ def _genres(db, playlist_id, limit):
     )]
 
 
+def _headline(kind: str, name: str) -> str:
+    """One heading rule for every category row.
+
+    Films get the bare name; shows and channels are marked, because the
+    taxonomies overlap - films and shows both have a Documentary - and two rows
+    with the same heading are just confusing.
+    """
+    name = (name or "").upper()
+    if kind == "series":
+        return f"SHOWS · {name}"
+    if kind == "live":
+        return f"LIVE · {name}"
+    return name
+
+
+def _category_name(db, playlist_id, kind, category_id) -> str:
+    row = db.one(
+        "SELECT sub_name, name FROM categories"
+        " WHERE playlist_id=? AND kind=? AND category_id=?",
+        (playlist_id, kind, str(category_id)),
+    )
+    if row is None:
+        return ""
+    return row["sub_name"] or row["name"]
+
+
+# Every section key names its row completely, so a row can be rebuilt from the
+# key alone - which is what lets an order you saved survive, whatever page of
+# the wall the row was on when you moved it. `kind` never contains an
+# underscore, so split(_, 2) is safe however odd a group name is.
+
+
+def _personal_section(db, playlist_id, key, cap):
+    table = "history" if key == "continue" else "favourites"
+    title = "CONTINUE WATCHING" if key == "continue" else "FAVOURITES"
+    rows = _personal(db, playlist_id, table, "sort_key", cap)
+    if not rows:
+        return None
+    # The trailing column is the kind; the model wants the tuple without it, so
+    # it is split off here rather than widening the row shape.
+    return (key, title, [r[:-1] for r in rows], [r[-1] for r in rows], None)
+
+
+def _newest_section(db, playlist_id, kind, cap, minimum=MIN_RAIL):
+    titles = {"movie": "NEW MOVIES", "series": "NEW SERIES", "live": "NEW CHANNELS"}
+    rows = _newest(db, playlist_id, kind, cap)
+    if len(rows) < minimum:
+        return None
+    return (f"new_{kind}", titles.get(kind, "NEW"), rows, [kind] * len(rows),
+            (kind, "recent", None))
+
+
+def _group_section(db, playlist_id, kind, group_name, cap, minimum=MIN_RAIL):
+    order = "s.num, s.name_folded" if kind == "live" else "s.added DESC"
+    rows = _by_group(db, playlist_id, kind, group_name, cap, order)
+    if len(rows) < minimum:
+        return None
+    return (f"grp_{kind}_{group_name}", _headline(kind, group_name), rows,
+            [kind] * len(rows), (kind, "group", group_name))
+
+
+def _category_section(db, playlist_id, kind, category_id, cap, minimum=MIN_RAIL):
+    rows = _by_category(db, playlist_id, kind, category_id, cap)
+    if len(rows) < minimum:
+        return None
+    name = _category_name(db, playlist_id, kind, category_id)
+    if not name:
+        return None
+    return (f"cat_{kind}_{category_id}", _headline(kind, name), rows,
+            [kind] * len(rows), (kind, "category", category_id))
+
+
+def _pinned_section(db, playlist_id, kind, node_type, payload, title, cap):
+    """A row you pinned. No MIN_RAIL: a small row you asked for is not a gap.
+
+    Built from the rows directly rather than through the section builders,
+    because a pin carries the heading it had when you made it and must not
+    depend on the category still having a name in the catalog.
+    """
+    if node_type == "group":
+        rows = _by_group(db, playlist_id, kind, payload, cap, "s.added DESC")
+    else:
+        rows = _by_category(db, playlist_id, kind, payload, cap)
+    if not rows:
+        return None
+    return (f"pin_{kind}_{node_type}_{payload}", (title or payload).upper(),
+            rows, [kind] * len(rows), (kind, node_type, payload))
+
+
+def section_for_key(db, playlist_id, key: str, cap: int = ROW_CAP):
+    """Rebuild one row from its key, or None when there is nothing behind it."""
+    if key in ("continue", "favourites"):
+        return _personal_section(db, playlist_id, key, cap)
+    head, _, rest = key.partition("_")
+    if head == "new" and rest:
+        return _newest_section(db, playlist_id, rest, cap, minimum=1)
+    if head in ("cat", "grp") and "_" in rest:
+        kind, _, payload = rest.partition("_")
+        builder = _group_section if head == "grp" else _category_section
+        return builder(db, playlist_id, kind, payload, cap, minimum=1)
+    if head == "pin":
+        kind, _, tail = rest.partition("_")
+        node_type, _, payload = tail.partition("_")
+        if not payload:
+            return None
+        row = db.one(
+            "SELECT title FROM home_rails WHERE playlist_id=? AND kind=?"
+            " AND node_type=? AND payload=?",
+            (playlist_id, kind, node_type, payload),
+        )
+        if row is None:
+            return None         # unpinned since; it is simply not a row now
+        return _pinned_section(db, playlist_id, kind, node_type, payload,
+                               row["title"], cap)
+    return None
+
+
+def apply_order(sections, order):
+    """Sort the wall by a saved order, keeping unsaved rows where they belong.
+
+    A key that was never moved has no saved rank, and dropping it to the end
+    would exile every newly pinned category to the bottom. Instead it inherits
+    the rank of the row that naturally precedes it, nudged along - so it stays
+    exactly where the app would have put it, relative to the rows you did move.
+    """
+    rank = {key: index for index, key in enumerate(order)}
+    placed, previous = [], -1.0
+    for position, section in enumerate(sections):
+        if section[0] in rank:
+            previous = float(rank[section[0]])
+        else:
+            previous += 1e-3
+        placed.append((previous, position, section))
+    placed.sort(key=lambda item: (item[0], item[1]))
+    return [section for _, _, section in placed]
+
+
+def saved_order(db, playlist_id) -> list:
+    return [r["key"] for r in db.query(
+        "SELECT key FROM home_order WHERE playlist_id=? ORDER BY position",
+        (playlist_id,),
+    )]
+
+
+def save_order(db, playlist_id, keys):
+    """Store the wall exactly as it now reads - what you see is what is saved."""
+    db.execute("DELETE FROM home_order WHERE playlist_id=?", (playlist_id,))
+    for position, key in enumerate(keys):
+        db.execute(
+            "INSERT OR REPLACE INTO home_order(playlist_id, key, position)"
+            " VALUES(?,?,?)", (playlist_id, key, position))
+
+
 def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS):
-    """The wall, in order: [(key, title, rows, kinds, target)].
+    """The wall's first page, in order: [(key, title, rows, kinds, target)].
 
     Empty rails are dropped rather than shown blank. `kinds` is a per-row list,
     because Continue Watching and Favourites can hold a film and a show side by
@@ -208,63 +361,56 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
     payload) - or None for the two personal rails, whose sidebar equivalents are
     per-kind while the rail is not.
     """
-    out = []
+    out, seen = [], set()
 
-    for key, table, title in (("continue", "history", "CONTINUE WATCHING"),
-                              ("favourites", "favourites", "FAVOURITES")):
-        rows = _personal(db, playlist_id, table, "sort_key", cap)
-        if rows:
-            # The trailing column is the kind; the model wants the tuple without
-            # it, so it is split off here rather than widening the row shape.
-            out.append((key, title, [r[:-1] for r in rows],
-                        [r[-1] for r in rows], None))
+    def add(section):
+        if section is not None and section[0] not in seen:
+            seen.add(section[0])
+            out.append(section)
+
+    for key in ("continue", "favourites"):
+        add(_personal_section(db, playlist_id, key, cap))
 
     # Your choices, after your history and before anything the app guessed.
     pinned_targets = set()
     for kind, node_type, payload, title in pinned_rails(db, playlist_id):
         pinned_targets.add((kind, node_type, payload))
-        if node_type == "group":
-            rows = _by_group(db, playlist_id, kind, payload, cap, "s.added DESC")
-        else:
-            rows = _by_category(db, playlist_id, kind, payload, cap)
-        if rows:
-            # No MIN_RAIL here: a small rail you asked for is not a gap.
-            out.append((f"pin_{kind}_{node_type}_{payload}", title.upper(), rows,
-                        [kind] * len(rows), (kind, node_type, payload)))
+        add(_pinned_section(db, playlist_id, kind, node_type, payload, title, cap))
 
-    for key, kind, title in (("new_movie", "movie", "NEW MOVIES"),
-                             ("new_series", "series", "NEW SERIES"),
-                             ("new_live", "live", "NEW CHANNELS")):
-        rows = _newest(db, playlist_id, kind, cap)
-        if len(rows) >= MIN_RAIL:
-            out.append((key, title, rows, [kind] * len(rows),
-                        (kind, "recent", None)))
+    for kind in ("movie", "series", "live"):
+        add(_newest_section(db, playlist_id, kind, cap))
 
     group = _biggest_group(db, playlist_id, "live")
     if group:
-        rows = _by_group(db, playlist_id, "live", group, cap, "s.num, s.name_folded")
-        if len(rows) >= MIN_RAIL:
-            out.append(("live_group", f"LIVE · {group.upper()}", rows,
-                        ["live"] * len(rows), ("live", "group", group)))
+        add(_group_section(db, playlist_id, "live", group, cap))
 
     for kind, category_id, name in _genres(db, playlist_id, genres):
         if (kind, "category", category_id) in pinned_targets:
             continue        # already on the wall by choice; twice is confusing
-        rows = _by_category(db, playlist_id, kind, category_id, cap)
-        if len(rows) >= MIN_RAIL:
-            # Films get the bare genre name; shows are marked, because the two
-            # taxonomies overlap (both have a Documentary) and two rails with
-            # the same heading are just confusing.
-            title = name.upper() if kind == "movie" else f"SHOWS · {name.upper()}"
-            out.append((f"genre_{kind}_{category_id}", title, rows,
-                        [kind] * len(rows), (kind, "category", category_id)))
+        add(_category_section(db, playlist_id, kind, category_id, cap))
 
     # Your history and your pins always stay: the cap exists to trim what the
     # app guessed, never what you asked for.
     keep = [s for s in out
             if s[0] in ("continue", "favourites") or s[0].startswith("pin_")]
     generated = [s for s in out if s not in keep]
-    return keep + generated[:max(0, MAX_RAILS - len(keep))]
+    out = keep + generated[:max(0, MAX_RAILS - len(keep))]
+
+    # A row you moved comes back where you put it, even when the wall would not
+    # have offered it on this page at all - it may have been trimmed by the cap,
+    # or been pages down when you moved it.
+    order = saved_order(db, playlist_id)
+    if not order:
+        return out
+    present = {s[0] for s in out}
+    for key in order:
+        if key in present:
+            continue
+        section = section_for_key(db, playlist_id, key, cap)
+        if section is not None:
+            out.append(section)
+            present.add(key)
+    return apply_order(out, order)
 
 
 # --------------------------------------------------------------------------
@@ -317,6 +463,7 @@ class HomeRail(QWidget):
     seeAllRequested = Signal(object)     # (kind, node_type, payload)
     unpinRequested = Signal(object)      # (kind, node_type, payload)
     cursorRequested = Signal(str, int)   # rail key, column
+    moveRequested = Signal(str, int)     # rail key, -1 up / +1 down
 
     def __init__(self, key: str, title: str, images, parent=None):
         super().__init__(parent)
@@ -347,6 +494,15 @@ class HomeRail(QWidget):
         header.addWidget(self.heading)
         header.addWidget(self.see_all)
         header.addWidget(self.unpin)
+
+        # Move the row. Arrows rather than a drag: a rail is already dragged
+        # sideways with the pointer, and one gesture per direction is nothing
+        # to learn.
+        self.move_up = self._move_button("▲", -1, "Move this row up  (Ctrl+↑)")
+        self.move_down = self._move_button("▼", 1, "Move this row down  (Ctrl+↓)")
+        header.addSpacing(4)
+        header.addWidget(self.move_up)
+        header.addWidget(self.move_down)
         header.addStretch(1)
         box.addLayout(header)
 
@@ -375,6 +531,15 @@ class HomeRail(QWidget):
         self.view.doubleClicked.connect(self._activated)
         self.view.pressed.connect(self._pressed)
         box.addWidget(self.view)
+
+    def _move_button(self, glyph: str, delta: int, tip: str) -> QPushButton:
+        button = QPushButton(glyph)
+        button.setObjectName("moveRailButton")
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setToolTip(tip)
+        button.clicked.connect(lambda: self.moveRequested.emit(self.key, delta))
+        return button
 
     def _activated(self, index):
         row = index.data(ROLE_ITEM)
@@ -434,6 +599,7 @@ class HomePage(QWidget):
     itemActivated = Signal(str, object)      # kind, row
     seeAllRequested = Signal(object)         # (kind, node_type, payload)
     unpinRequested = Signal(object)          # (kind, node_type, payload)
+    moveRequested = Signal(str, int)         # rail key, -1 up / +1 down
 
     def __init__(self, images, parent=None):
         super().__init__(parent)
@@ -497,6 +663,7 @@ class HomePage(QWidget):
                 rail.seeAllRequested.connect(self.seeAllRequested)
                 rail.unpinRequested.connect(self.unpinRequested)
                 rail.cursorRequested.connect(self._cursor_pressed)
+                rail.moveRequested.connect(self.moveRequested)
                 self.rails[key] = rail
             rail.heading.setText(title)
             rail.set_target(target, pinned=key.startswith("pin_"))
@@ -505,6 +672,11 @@ class HomePage(QWidget):
             self.root.insertWidget(position + 1, rail)
 
         self._order = wanted
+        for position, key in enumerate(wanted):
+            # Nothing to move past at the ends of the wall.
+            rail = self.rails[key]
+            rail.move_up.setEnabled(position > 0)
+            rail.move_down.setEnabled(position < len(wanted) - 1)
         self.empty.setVisible(not sections)
         if not sections:
             self.empty.setText(
@@ -518,6 +690,10 @@ class HomePage(QWidget):
 
     def rail_keys(self):
         return list(self._order)
+
+    def rail_title(self, key: str) -> str:
+        rail = self.rails.get(key)
+        return rail.heading.text() if rail is not None else key
 
     def _image_arrived(self, _url):
         for rail in self.rails.values():
@@ -613,6 +789,15 @@ class HomePage(QWidget):
             Qt.Key_Home: (0, -FAR_END), Qt.Key_End: (0, FAR_END),
         }
         key = event.key()
+        # Ctrl+↑/↓ moves the row the cursor is on, which is the same gesture as
+        # the ▲ ▼ buttons without reaching for them.
+        if (key in (Qt.Key_Up, Qt.Key_Down)
+                and event.modifiers() & Qt.ControlModifier):
+            if self._cursor is not None:
+                self.moveRequested.emit(self._cursor[0],
+                                        -1 if key == Qt.Key_Up else 1)
+            event.accept()
+            return
         if key in moves:
             self._move(*moves[key])
             event.accept()

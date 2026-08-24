@@ -1332,20 +1332,20 @@ class TestHomeSections(unittest.TestCase):
         for n in range(8):
             self.add("movie", f"h{n}", f"Horror {n}", category="c1")
         sections = self.sections()
-        self.assertIn("genre_movie_c1", sections)
-        rows, kinds, target = sections["genre_movie_c1"]
+        self.assertIn("cat_movie_c1", sections)
+        rows, kinds, target = sections["cat_movie_c1"]
         self.assertEqual(kinds, ["movie"] * len(rows))
         self.assertEqual(target, ("movie", "category", "c1"))
 
     def test_no_genre_taxonomy_means_no_genre_rails(self):
         """Not five empty headings — providers differ, and many ship none."""
         keys = self.sections()
-        self.assertFalse([k for k in keys if k.startswith("genre_")])
+        self.assertFalse([k for k in keys if k.startswith("cat_")])
 
     def test_a_genre_too_small_to_fill_a_rail_is_skipped(self):
         self.category("movie", "c2", "Tiny", count=500)
         self.add("movie", "t1", "Tiny One", category="c2")
-        self.assertNotIn("genre_movie_c2", self.sections())
+        self.assertNotIn("cat_movie_c2", self.sections())
 
     def test_show_genres_are_labelled_so_headings_do_not_collide(self):
         """Both taxonomies have a Documentary; two identical headings confuse."""
@@ -1637,6 +1637,171 @@ class TestHomeCursor(unittest.TestCase):
                                  (0, self.far), (self.page, 0)):
             self.assertIsNone(self.move([], (0, 0), d_rail, d_column))
             self.assertIsNone(self.move([0, 0], None, d_rail, d_column))
+
+
+class TestHomeOrder(unittest.TestCase):
+    """Moving a homepage row up or down, and remembering where it went."""
+
+    def setUp(self):
+        import tempfile
+        import time
+
+        from ui.home_page import (
+            apply_order, home_sections, pin_rail, save_order, saved_order,
+            section_for_key,
+        )
+
+        self.apply = apply_order
+        self.build = home_sections
+        self.pin = pin_rail
+        self.save = save_order
+        self.saved = saved_order
+        self.for_key = section_for_key
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = Database(self.dir / "t.sqlite")
+        for playlist in (1, 2):
+            self.db.execute(
+                "INSERT INTO playlists(id, name, type, position) VALUES(?,?,'xtream',0)",
+                (playlist, f"p{playlist}"))
+        self.now = int(time.time())
+
+    def tearDown(self):
+        import shutil
+
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def add(self, kind, stream_id, name, category):
+        self.db.execute(
+            "INSERT INTO streams(playlist_id, kind, stream_id, name, name_folded,"
+            " available, dup_rank, category_id, added) VALUES(1,?,?,?,?,1,1,?,?)",
+            (kind, stream_id, name, fold(name), category, self.now),
+        )
+
+    def category(self, kind, category_id, sub_name, group, count=500, items=8):
+        self.db.execute(
+            "INSERT INTO categories(playlist_id, kind, category_id, name,"
+            " group_name, sub_name, item_count) VALUES(1,?,?,?,?,?,?)",
+            (kind, category_id, sub_name, group, sub_name, count),
+        )
+        for n in range(items):
+            self.add(kind, f"{category_id}-{n}", f"{sub_name} {n}", category_id)
+
+    def keys(self, playlist=1):
+        return [key for key, _t, _r, _k, _ta in self.build(self.db, playlist)]
+
+    # -- the pure sort ------------------------------------------------------
+
+    def sections(self, *keys):
+        return [(key, key.upper(), [1], ["movie"], None) for key in keys]
+
+    def ordered(self, sections, order):
+        return [s[0] for s in self.apply(sections, order)]
+
+    def test_saved_keys_lead_in_the_order_they_were_saved(self):
+        rows = self.sections("a", "b", "c")
+        self.assertEqual(self.ordered(rows, ["c", "a", "b"]), ["c", "a", "b"])
+
+    def test_an_empty_order_changes_nothing(self):
+        rows = self.sections("a", "b", "c")
+        self.assertEqual(self.ordered(rows, []), ["a", "b", "c"])
+
+    def test_an_unsaved_row_stays_beside_the_row_it_follows(self):
+        """A newly pinned category must not be exiled to the bottom."""
+        rows = self.sections("a", "new", "b")
+        self.assertEqual(self.ordered(rows, ["b", "a"]), ["b", "a", "new"])
+        rows = self.sections("a", "b", "new")
+        self.assertEqual(self.ordered(rows, ["a", "b"]), ["a", "b", "new"])
+
+    def test_several_unsaved_rows_keep_their_own_order(self):
+        rows = self.sections("a", "x", "y", "b")
+        self.assertEqual(self.ordered(rows, ["b", "a"]), ["b", "a", "x", "y"])
+
+    def test_an_unsaved_row_at_the_very_top_stays_at_the_top(self):
+        rows = self.sections("new", "a", "b")
+        self.assertEqual(self.ordered(rows, ["a", "b"]), ["new", "a", "b"])
+
+    def test_a_saved_key_with_no_row_leaves_no_hole(self):
+        rows = self.sections("a", "b")
+        self.assertEqual(self.ordered(rows, ["b", "gone", "a"]), ["b", "a"])
+
+    # -- the table ----------------------------------------------------------
+
+    def test_the_saved_order_round_trips(self):
+        self.save(self.db, 1, ["b", "a", "c"])
+        self.assertEqual(self.saved(self.db, 1), ["b", "a", "c"])
+
+    def test_saving_again_replaces_rather_than_appends(self):
+        self.save(self.db, 1, ["a", "b"])
+        self.save(self.db, 1, ["b", "a"])
+        self.assertEqual(self.saved(self.db, 1), ["b", "a"])
+
+    def test_the_order_is_per_playlist(self):
+        self.save(self.db, 1, ["a", "b"])
+        self.assertEqual(self.saved(self.db, 2), [])
+
+    # -- rebuilding a row from its key --------------------------------------
+
+    def test_every_key_shape_rebuilds(self):
+        self.category("movie", "c1", "Horror", "Genres")
+        self.category("live", "c2", "News", "United States")
+        for key, heading in (("cat_movie_c1", "HORROR"),
+                             ("cat_live_c2", "LIVE · NEWS"),
+                             ("grp_movie_Genres", "GENRES"),
+                             ("new_movie", "NEW MOVIES")):
+            section = self.for_key(self.db, 1, key)
+            self.assertIsNotNone(section, key)
+            self.assertEqual(section[0], key)
+            self.assertEqual(section[1], heading)
+
+    def test_a_group_name_with_an_underscore_survives_the_key(self):
+        """kind never has one, so everything after the second _ is the payload."""
+        self.category("movie", "c9", "Odd", "Old_School")
+        section = self.for_key(self.db, 1, "grp_movie_Old_School")
+        self.assertIsNotNone(section)
+        self.assertEqual(section[4], ("movie", "group", "Old_School"))
+
+    def test_a_pinned_key_rebuilds_with_the_title_it_was_pinned_under(self):
+        self.category("movie", "c1", "Bangla Modern", "Bangla")
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        section = self.for_key(self.db, 1, "pin_movie_group_Bangla")
+        self.assertEqual(section[1], "BANGLA")
+
+    def test_an_unpinned_key_rebuilds_as_nothing(self):
+        self.category("movie", "c1", "Bangla Modern", "Bangla")
+        self.assertIsNone(self.for_key(self.db, 1, "pin_movie_group_Bangla"))
+
+    def test_a_key_for_something_that_does_not_exist_is_none(self):
+        for key in ("", "junk", "cat_movie_nope", "grp_movie_Nope", "pin_x"):
+            self.assertIsNone(self.for_key(self.db, 1, key), key)
+
+    # -- the wall obeys it --------------------------------------------------
+
+    def test_the_wall_follows_a_saved_order(self):
+        for index, name in enumerate(("One", "Two", "Three")):
+            self.category("movie", f"c{index}", name, "Genres")
+        natural = self.keys()
+        self.assertGreaterEqual(len(natural), 3)
+        wanted = list(reversed(natural))
+        self.save(self.db, 1, wanted)
+        self.assertEqual(self.keys(), wanted)
+
+    def test_a_row_the_page_would_not_have_shown_comes_back_because_you_moved_it(self):
+        """Moved up from deep in the wall, it is on the first page next time."""
+        for index in range(14):
+            self.category("movie", f"c{index}", f"G{index}", "Genres",
+                          count=100 - index)
+        natural = self.keys()
+        self.assertNotIn("cat_movie_c13", natural)      # trimmed by the cap
+        self.save(self.db, 1, ["cat_movie_c13"] + natural)
+        self.assertEqual(self.keys()[0], "cat_movie_c13")
+
+    def test_the_order_does_not_leak_between_playlists(self):
+        self.category("movie", "c1", "One", "Genres")
+        self.category("movie", "c2", "Two", "Genres")
+        self.save(self.db, 2, ["cat_movie_c2", "cat_movie_c1"])
+        keys = self.keys(1)
+        self.assertLess(keys.index("cat_movie_c1"), keys.index("cat_movie_c2"))
 
 
 class TestEpisodeGrid(unittest.TestCase):

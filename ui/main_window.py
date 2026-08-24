@@ -32,7 +32,8 @@ from ui.category_tree import CategoryTree, build_groups
 from ui.downloads_panel import DownloadsPanel
 from ui.effects_dialog import EffectsDialog, load_saved_effects
 from ui.home_page import (
-    HomePage, home_sections, is_pinned, pin_keys, pin_rail, unpin_rail,
+    HomePage, home_sections, is_pinned, pin_keys, pin_rail, save_order,
+    unpin_rail,
 )
 from ui.models import (
     ROLE_ITEM, CatalogModel, ChannelDelegate, ImageCache, PosterDelegate,
@@ -1985,6 +1986,7 @@ class MainWindow(QMainWindow):
         self.home_page.itemActivated.connect(self._activate_home)
         self.home_page.seeAllRequested.connect(self._see_all_rail)
         self.home_page.unpinRequested.connect(self._unpin_rail)
+        self.home_page.moveRequested.connect(self.move_rail)
         self.stack.addWidget(self.home_page)
 
     @property
@@ -2048,6 +2050,30 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{'Removed' if pinned else 'Added'} “{title}” "
             f"{'from' if pinned else 'to'} the homepage", 4000)
+
+    def move_rail(self, key: str, delta: int):
+        """Swap a homepage row with its neighbour, and remember the result.
+
+        The whole visible order is stored rather than one row's new index, so
+        the rule is simply "what you see is what is saved" — and a row that
+        turns up later still lands where the app would have put it.
+        """
+        if self.playlist is None:
+            return
+        keys = self.home_page.rail_keys()
+        if key not in keys:
+            return
+        position = keys.index(key)
+        target = position + (1 if delta > 0 else -1)
+        if not 0 <= target < len(keys):
+            return              # nothing to move past at the ends of the wall
+        keys[position], keys[target] = keys[target], keys[position]
+        save_order(self.db, self.playlist.id, keys)
+        self.refresh_home()
+        self.home_page.ensure_visible()
+        self.statusBar().showMessage(
+            f"Moved “{self.home_page.rail_title(key)}” "
+            f"{'down' if delta > 0 else 'up'}", 3000)
 
     def _unpin_rail(self, target):
         """The ✕ on a pinned rail, which knows its own kind."""

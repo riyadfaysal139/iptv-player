@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS home_rails (
     PRIMARY KEY (playlist_id, kind, node_type, payload)
 );
 
+-- The order the rows sit in, once you have moved one. Holds every row that was
+-- on the wall at the time, so what you see is what is stored; a row that turns
+-- up later keeps its natural place beside the ones either side of it.
+CREATE TABLE IF NOT EXISTS home_order (
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    key         TEXT NOT NULL,          -- the section key, which names its row
+    position    INTEGER NOT NULL,
+    PRIMARY KEY (playlist_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS collections (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,

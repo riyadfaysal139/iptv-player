@@ -200,6 +200,16 @@ one tab's catalog — steps aside and gives the wall the full width. Clicking an
 tab brings all three back, **including the tab already selected**: it is where
 you would land, so it has to work.
 
+**Arrange it yourself.** Every row carries **▲ ▼** beside its heading; one click
+moves it past its neighbour, and `Ctrl+↑` / `Ctrl+↓` do the same to the row the
+cursor is on. The arrangement is remembered per playlist, and the whole visible
+order is stored rather than one row's new index — what you see is what is saved.
+A row that turns up later, a category you have just pinned or a genre the
+provider has grown, keeps the place the app would have given it, beside the rows
+either side of it. Because a row's key names it completely, a row you move up
+from deep in the wall is on the first page next time, even if the app would not
+have offered it there at all.
+
 **Pin your own.** Any sidebar group or category can be added to the homepage:
 hover the row and click the pin, or right-click it and choose *Add to
 homepage*. `BANGLA` under Movies — 385 films across five categories, nowhere
@@ -374,6 +384,7 @@ live channels.
 | `Ctrl+F` | Search everything · `Esc` leaves it |
 | `F` | Fullscreen · `Esc` leaves it |
 | `P` | Picture-in-Picture · `Esc` leaves it |
+| `Ctrl+↑` `Ctrl+↓` | Move a homepage row up or down |
 | `Ctrl+L` | Show or hide the browser |
 | `Ctrl+Shift+V` | Show or hide the video pane |
 
