@@ -184,6 +184,16 @@ Double-click plays, and **leaves you on the homepage** with the video docked
 beside it; only a show takes you away, to its own page. **See all** on a row
 hands over to the sidebar node it corresponds to.
 
+**The arrows move across the wall.** `←` `→` run along a row, `↑` `↓` step
+between rows keeping your place across, `Home`/`End` jump to the ends of a row
+and `PgUp`/`PgDn` a few rows at a time. The poster under the cursor is drawn
+larger, framed in yellow; the row scrolls sideways and the page scrolls down to
+keep it in view. `Enter` plays it — or opens it, for a show. Every cell reserves
+the space that growth needs, so nothing shifts as the cursor moves. Playing
+something hands the keyboard to the video, as everywhere else in the app; one
+click anywhere on the wall takes it back, with the cursor landing where you
+clicked.
+
 The homepage does not belong to a tab, so while it is up the house icon is the
 only thing lit, TV/MOVIES/SERIES go grey, and the category sidebar — which lists
 one tab's catalog — steps aside and gives the wall the full width. Clicking any
@@ -343,8 +353,9 @@ live channels.
 | Key | Action |
 |---|---|
 | `Space` | Play / pause · plays the next episode when the up-next card is up |
-| `←` `→` | Seek −10 s / +10 s |
-| `↑` `↓` | Volume −5 / +5 |
+| `←` `→` | Seek −10 s / +10 s · move along a row on the homepage |
+| `↑` `↓` | Volume −5 / +5 · move between rows on the homepage |
+| `Enter` | Play what the homepage cursor is on |
 | `M` | Mute |
 | `[` `]` | Speed down / up · `=` normal speed |
 | `Ctrl+F` | Search everything · `Esc` leaves it |
@@ -366,7 +377,11 @@ channel list. Whoever has focus gets them:
 - **The list has focus** — arrows move through channels, as before. Click the
   list to browse. Closing a page (search, a series) with no video
   pane on screen hands the keyboard back to the list rather than to the hidden
-  video, which would leave the arrows doing nothing at all.
+  video, which would leave the arrows doing nothing at all. The same applies
+  when the video pane folds away by itself once playback stops: the keyboard
+  goes back to whatever is actually on screen — the list, or the homepage wall.
+- **The homepage has focus** — arrows move the poster cursor, and `Enter` plays.
+  `Home`, `End`, `PgUp` and `PgDn` work there too.
 - **Fullscreen or Picture-in-Picture** — always the player, since there is no
   list to compete.
 - **Typing in a search box** — always the box. `Space` inserts a space and the

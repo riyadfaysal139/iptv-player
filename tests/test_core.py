@@ -1568,5 +1568,75 @@ class TestCatalogModelKinds(unittest.TestCase):
         self.assertEqual(self.kinds(), ["movie", "movie"])
 
 
+class TestHomeCursor(unittest.TestCase):
+    """Where the arrow keys land on the homepage's wall of rails."""
+
+    def setUp(self):
+        from ui.home_page import FAR_END, PAGE_RAILS, move_cursor
+
+        self.move = move_cursor
+        self.page = PAGE_RAILS
+        self.far = FAR_END
+        # three rails: 4 posters, 2, 6
+        self.wall = [4, 2, 6]
+
+    # -- along a rail ------------------------------------------------------
+
+    def test_right_and_left_step_one(self):
+        self.assertEqual(self.move(self.wall, (0, 1), 0, 1), (0, 2))
+        self.assertEqual(self.move(self.wall, (0, 1), 0, -1), (0, 0))
+
+    def test_the_ends_of_a_rail_clamp_rather_than_wrap(self):
+        """Running off a rail should stop, not take you somewhere else."""
+        self.assertEqual(self.move(self.wall, (0, 3), 0, 1), (0, 3))
+        self.assertEqual(self.move(self.wall, (0, 0), 0, -1), (0, 0))
+
+    def test_home_and_end(self):
+        self.assertEqual(self.move(self.wall, (2, 3), 0, -self.far), (2, 0))
+        self.assertEqual(self.move(self.wall, (2, 3), 0, self.far), (2, 5))
+
+    # -- between rails -----------------------------------------------------
+
+    def test_down_and_up_keep_the_column(self):
+        self.assertEqual(self.move(self.wall, (0, 3), 1, 0), (1, 1))
+        self.assertEqual(self.move(self.wall, (2, 1), -1, 0), (1, 1))
+
+    def test_a_shorter_rail_clamps_the_column(self):
+        """Column 3 has nowhere to land on a rail of two."""
+        self.assertEqual(self.move(self.wall, (0, 3), 1, 0), (1, 1))
+
+    def test_the_top_and_bottom_of_the_wall_clamp(self):
+        self.assertEqual(self.move(self.wall, (0, 2), -1, 0), (0, 2))
+        self.assertEqual(self.move(self.wall, (2, 2), 1, 0), (2, 2))
+
+    def test_page_keys_jump_several_rails_and_still_clamp(self):
+        wall = [3] * 8
+        self.assertEqual(self.move(wall, (0, 1), self.page, 0), (self.page, 1))
+        self.assertEqual(self.move(wall, (7, 1), self.page, 0), (7, 1))
+        self.assertEqual(self.move(wall, (1, 1), -self.page, 0), (0, 1))
+
+    # -- rails that are not there ------------------------------------------
+
+    def test_an_empty_rail_is_skipped_not_landed_on(self):
+        self.assertEqual(self.move([4, 0, 6], (0, 1), 1, 0), (2, 1))
+
+    def test_a_cursor_on_a_vanished_rail_snaps_to_the_nearest_live_one(self):
+        """An unpinned category takes its rail with it mid-session."""
+        self.assertEqual(self.move([4, 0, 6], (1, 2), 0, 0), (0, 2))
+
+    def test_a_cursor_past_the_end_of_a_shrunken_wall_comes_back(self):
+        self.assertEqual(self.move([4], (5, 9), 0, 0), (0, 3))
+
+    def test_no_cursor_starts_at_the_first_poster(self):
+        self.assertEqual(self.move(self.wall, None), (0, 0))
+        self.assertEqual(self.move([0, 0, 3], None), (2, 0))
+
+    def test_an_empty_wall_takes_every_key_without_raising(self):
+        for d_rail, d_column in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                                 (0, self.far), (self.page, 0)):
+            self.assertIsNone(self.move([], (0, 0), d_rail, d_column))
+            self.assertIsNone(self.move([0, 0], None, d_rail, d_column))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

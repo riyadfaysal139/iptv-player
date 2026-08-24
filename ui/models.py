@@ -363,6 +363,17 @@ class PosterDelegate(QStyledItemDelegate):
     def sizeHint(self, option, index) -> QSize:
         return QSize(POSTER_W + 14, POSTER_H + 40)
 
+    @staticmethod
+    def art_rect(option_rect: QRect) -> QRect:
+        """The poster itself, inside its cell.
+
+        Shared with the homepage's rail delegate, which strokes a border round
+        the poster the keyboard cursor is on and needs the very rectangle the
+        art was drawn into.
+        """
+        cell = option_rect.adjusted(5, 5, -5, -5)
+        return QRect(cell.left(), cell.top(), cell.width(), POSTER_H)
+
     def paint(self, painter: QPainter, option, index):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -370,7 +381,7 @@ class PosterDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
 
         cell = option.rect.adjusted(5, 5, -5, -5)
-        art = QRect(cell.left(), cell.top(), cell.width(), POSTER_H)
+        art = self.art_rect(option.rect)
 
         if selected:
             painter.fillRect(option.rect, QColor("#16204f"))

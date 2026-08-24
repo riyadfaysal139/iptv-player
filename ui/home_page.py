@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QModelIndex, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QPen
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QListView, QPushButton, QScrollArea,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QFrame, QHBoxLayout, QLabel, QListView, QPushButton,
+    QScrollArea, QStyle, QStyleOptionViewItem, QVBoxLayout, QWidget,
 )
 
 from ui.models import (
@@ -29,6 +30,16 @@ GENRE_ROWS = 5          # how many of the provider's genres get a rail
 MIN_RAIL = 6            # below this it is not a row, it is a gap
 MAX_RAILS = 11          # a wall you scroll, not one you get lost in
 RECENT_DAYS = 30
+
+# The keyboard cursor's poster is drawn this much larger, into a halo of empty
+# space every cell reserves. GROW_X/GROW_Y are sized so the scaled paint still
+# lands inside the cell's own rectangle: anything spilling past it would be
+# overdrawn by the next poster and clipped away by a partial repaint.
+FOCUS_SCALE = 1.18
+GROW_X, GROW_Y = 14, 22
+CURSOR_COLOUR = "#f5d90a"
+PAGE_RAILS = 3          # how far PageUp/PageDown jump
+FAR_END = 10 ** 6       # Home/End, expressed as a move the clamp absorbs
 
 # The same tuple apply_item_filter selects, so CatalogModel and PosterDelegate
 # take these rows unchanged.
@@ -260,12 +271,76 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
 # --------------------------------------------------------------------------
 
 
+def move_cursor(lengths, cursor, d_rail: int = 0, d_column: int = 0):
+    """Where an arrow key lands on a wall of rails `lengths` posters long.
+
+    Clamps at every edge rather than wrapping - the same choice next_episode()
+    makes, and for the same reason: running off the end of a rail should stop,
+    not silently take you somewhere else.
+
+    Empty rails are skipped, and a cursor sitting on one (its category was
+    unpinned, or the provider dropped it) is snapped to the nearest rail that
+    still has posters. Returns (rail, column), or None for an empty wall.
+    """
+    live = [i for i, n in enumerate(lengths) if n > 0]
+    if not live:
+        return None
+    rail, column = (live[0], 0) if cursor is None else cursor
+    rail = max(0, min(len(lengths) - 1, int(rail)))
+    if rail not in live:
+        rail = min(live, key=lambda i: (abs(i - rail), i))
+    if d_rail:
+        at = live.index(rail)
+        rail = live[max(0, min(len(live) - 1, at + d_rail))]
+    column = max(0, min(lengths[rail] - 1, int(column) + d_column))
+    return rail, column
+
+
+class RailDelegate(PosterDelegate):
+    """The catalog's poster, with the cursor's own copy drawn bigger.
+
+    A subclass rather than an edit to PosterDelegate, because the same delegate
+    draws the catalog grid and the search page and neither wants a halo.
+
+    The growth is a painter scale about the cell's centre, so the poster, its
+    rating badge and its title all zoom together and none of the parent's
+    geometry is repeated here. The cursor is the view's selection, which is what
+    lets the parent's own selected colours come through unchanged.
+    """
+
+    def sizeHint(self, option, index) -> QSize:
+        hint = super().sizeHint(option, index)
+        return QSize(hint.width() + 2 * GROW_X, hint.height() + 2 * GROW_Y)
+
+    def paint(self, painter, option, index):
+        inner = QStyleOptionViewItem(option)
+        inner.rect = option.rect.adjusted(GROW_X, GROW_Y, -GROW_X, -GROW_Y)
+        if not option.state & QStyle.State_Selected:
+            # Exactly the cell it would have had before the halo existed.
+            super().paint(painter, inner, index)
+            return
+
+        centre = option.rect.center()
+        painter.save()
+        painter.translate(centre)
+        painter.scale(FOCUS_SCALE, FOCUS_SCALE)
+        painter.translate(-centre)
+        super().paint(painter, inner, index)
+        # Drawn inside the scaled transform, so it frames the poster the parent
+        # just drew whatever the scale is.
+        painter.setPen(QPen(QColor(CURSOR_COLOUR), 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(self.art_rect(inner.rect).adjusted(0, 0, -1, -1))
+        painter.restore()
+
+
 class HomeRail(QWidget):
     """One horizontal row of posters, scrolling sideways."""
 
     activated = Signal(str, object)      # kind, row
     seeAllRequested = Signal(object)     # (kind, node_type, payload)
     unpinRequested = Signal(object)      # (kind, node_type, payload)
+    cursorRequested = Signal(str, int)   # rail key, column
 
     def __init__(self, key: str, title: str, images, parent=None):
         super().__init__(parent)
@@ -309,21 +384,45 @@ class HomeRail(QWidget):
         self.view.setWrapping(False)
         self.view.setUniformItemSizes(True)
         self.view.setSpacing(4)
+        # NoFocus: the keyboard belongs to the page, which drives every rail's
+        # cursor. The cursor itself *is* the selection, so the poster delegate's
+        # existing selected painting is what marks it.
         self.view.setFocusPolicy(Qt.NoFocus)
-        self.view.setSelectionMode(QListView.NoSelection)
+        self.view.setSelectionMode(QListView.SingleSelection)
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setHorizontalScrollMode(QListView.ScrollPerPixel)
-        self.view.setFixedHeight(POSTER_H + 40 + self.view.spacing() * 2 + 14)
-        self.view.setItemDelegate(PosterDelegate(images, lambda: self.model, self))
+        self.view.setFixedHeight(POSTER_H + 40 + 2 * GROW_Y
+                                 + self.view.spacing() * 2 + 14)
+        self.view.setItemDelegate(RailDelegate(images, lambda: self.model, self))
         # Double-click, not single: a rail is dragged sideways, and a drag that
         # ends in a click would otherwise start playing something.
         self.view.doubleClicked.connect(self._activated)
+        self.view.pressed.connect(self._pressed)
         box.addWidget(self.view)
 
     def _activated(self, index):
         row = index.data(ROLE_ITEM)
         if row is not None:
             self.activated.emit(index.data(ROLE_KIND) or "movie", row)
+
+    def _pressed(self, index):
+        """A click puts the cursor where you clicked, and the keyboard here."""
+        if index.isValid():
+            self.cursorRequested.emit(self.key, index.row())
+
+    def set_cursor(self, column):
+        """Put the cursor on `column`, or None to take it off this rail."""
+        if column is None or not 0 <= column < self.model.rowCount():
+            self.view.clearSelection()
+            self.view.setCurrentIndex(QModelIndex())
+            return None
+        index = self.model.index(column, 0)
+        self.view.setCurrentIndex(index)
+        return index
+
+    def activate(self, column: int):
+        if 0 <= column < self.model.rowCount():
+            self._activated(self.model.index(column, 0))
 
     def _see_all_clicked(self):
         if self.target is not None:
@@ -366,6 +465,13 @@ class HomePage(QWidget):
         self.setObjectName("homePage")
         self.rails = {}
         self._order = []
+        # (rail key, column), plus the rail's position for the case where the
+        # key itself is gone by the next rebuild.
+        self._cursor = None
+        self._cursor_row = 0
+        # The page owns the arrows; the scroll area must not take them, or
+        # clicking the wall would leave them scrolling it instead.
+        self.setFocusPolicy(Qt.StrongFocus)
         self._build()
         images.loaded.connect(self._image_arrived)
 
@@ -378,10 +484,13 @@ class HomePage(QWidget):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setObjectName("homeScroll")
+        scroll.setFocusPolicy(Qt.NoFocus)
         body = QWidget()
         body.setObjectName("homeBody")
+        body.setFocusPolicy(Qt.NoFocus)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
+        self.scroll = scroll
 
         self.root = QVBoxLayout(body)
         self.root.setContentsMargins(24, 20, 24, 28)
@@ -411,6 +520,7 @@ class HomePage(QWidget):
                 rail.activated.connect(self.itemActivated)
                 rail.seeAllRequested.connect(self.seeAllRequested)
                 rail.unpinRequested.connect(self.unpinRequested)
+                rail.cursorRequested.connect(self._cursor_pressed)
                 self.rails[key] = rail
             rail.heading.setText(title)
             rail.set_target(target, pinned=key.startswith("pin_"))
@@ -425,6 +535,10 @@ class HomePage(QWidget):
                 "Nothing to show yet.\n\nOnce the catalog has been fetched, what "
                 "you watch and what you favourite turn up here."
             )
+        # Setting a model's rows drops its selection, and the wall is rebuilt on
+        # every visit, so the cursor has to be put back rather than reset - or
+        # opening the homepage would throw you to the top-left each time.
+        self._apply_cursor()
 
     def rail_keys(self):
         return list(self._order)
@@ -433,3 +547,102 @@ class HomePage(QWidget):
         for rail in self.rails.values():
             if rail.isVisible():
                 rail.view.viewport().update()
+
+    # ----------------------------------------------------------- the cursor
+
+    def _keys(self):
+        return [key for key in self._order if key in self.rails]
+
+    def _lengths(self, keys):
+        return [self.rails[key].rows() for key in keys]
+
+    def _position(self, keys):
+        """The cursor as (rail index, column), for move_cursor to work on."""
+        if self._cursor is None:
+            return None
+        key, column = self._cursor
+        return (keys.index(key) if key in keys else self._cursor_row), column
+
+    def _move(self, d_rail: int = 0, d_column: int = 0):
+        keys = self._keys()
+        target = move_cursor(self._lengths(keys), self._position(keys),
+                             d_rail, d_column)
+        if target is None:
+            return
+        self._cursor = (keys[target[0]], target[1])
+        self._apply_cursor(scroll=True)
+
+    def _apply_cursor(self, scroll: bool = False):
+        keys = self._keys()
+        target = move_cursor(self._lengths(keys), self._position(keys))
+        if target is None:
+            self._cursor = None
+            for rail in self.rails.values():
+                rail.set_cursor(None)
+            return
+        rail_index, column = target
+        self._cursor = (keys[rail_index], column)
+        self._cursor_row = rail_index
+        for key, rail in self.rails.items():
+            # Exactly one rail may hold a selection, or two posters look focused
+            # at once and neither of them is where the arrows will act.
+            rail.set_cursor(column if key == self._cursor[0] else None)
+        if scroll:
+            self.ensure_visible()
+
+    def ensure_visible(self):
+        """Follow the cursor sideways along its rail, and down the wall."""
+        if self._cursor is None:
+            return
+        key, column = self._cursor
+        rail = self.rails.get(key)
+        if rail is None or not 0 <= column < rail.rows():
+            return
+        rail.view.scrollTo(rail.model.index(column, 0),
+                           QAbstractItemView.EnsureVisible)
+        self.scroll.ensureWidgetVisible(rail, 0, 0)
+
+    def _cursor_pressed(self, key: str, column: int):
+        """A click on a poster: the cursor goes there, and so does the keyboard.
+
+        The rails take no focus of their own, so without this a click would
+        leave the arrows wherever they were - usually the category tree.
+        """
+        self.setFocus(Qt.MouseFocusReason)
+        self._cursor = (key, int(column))
+        self._apply_cursor()
+
+    def _activate_cursor(self):
+        if self._cursor is None:
+            return
+        key, column = self._cursor
+        rail = self.rails.get(key)
+        if rail is not None:
+            rail.activate(column)
+
+    def mousePressEvent(self, event):
+        self.setFocus(Qt.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        """The wall's own keyboard.
+
+        Space is deliberately absent: it is the global play/pause and the
+        up-next card's play, and taking it here would break both.
+        """
+        moves = {
+            Qt.Key_Left: (0, -1), Qt.Key_Right: (0, 1),
+            Qt.Key_Up: (-1, 0), Qt.Key_Down: (1, 0),
+            Qt.Key_PageUp: (-PAGE_RAILS, 0), Qt.Key_PageDown: (PAGE_RAILS, 0),
+            Qt.Key_Home: (0, -FAR_END), Qt.Key_End: (0, FAR_END),
+        }
+        key = event.key()
+        if key in moves:
+            self._move(*moves[key])
+            event.accept()
+            return
+        if key in (Qt.Key_Return, Qt.Key_Enter):
+            self._activate_cursor()
+            event.accept()
+            return
+        super().keyPressEvent(event)

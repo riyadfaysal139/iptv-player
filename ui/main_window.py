@@ -1371,6 +1371,7 @@ class MainWindow(QMainWindow):
         if not visible:
             # Remember the width it was actually dragged to, not the default.
             self._player_width = self._splitter.sizes()[2] or self._player_width
+        held_keyboard = self._player_holds_keyboard()
         self._right_pane.setVisible(visible)
         if visible:
             self._splitter.setSizes(
@@ -1379,7 +1380,24 @@ class MainWindow(QMainWindow):
             # layout applies its sizes on a posted LayoutRequest, which would
             # otherwise not be delivered until after play() has started.
             QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+        elif held_keyboard:
+            # The pane just folded away with the keyboard inside it. Qt leaves
+            # focus on the hidden surface, or drops it on whichever button comes
+            # next, and the arrows do nothing either way — measured on the
+            # homepage after playback stops.
+            self._return_focus()
         self.player_action.setChecked(visible)
+
+    def _player_holds_keyboard(self) -> bool:
+        """Is the keyboard somewhere inside the video pane right now?
+
+        self.focusWidget(), not QApplication's: an inactive window has no
+        application focus widget at all, and the answer here is about this
+        window, not about which window the desktop has on top.
+        """
+        focused = self.focusWidget()
+        return focused is not None and (focused is self.player.surface
+                                        or self.player.isAncestorOf(focused))
 
     def _return_focus(self):
         """Hand the keyboard back to whatever is actually on screen.
@@ -1389,8 +1407,18 @@ class MainWindow(QMainWindow):
         hidden widget leaves the window with no focus widget at all: the list
         then ignores the arrows entirely, which is exactly what happened after
         closing the search page in a browse-only window.
+
+        The list is only the right fallback when the list is what the pane is
+        showing. With the homepage up it is hidden too, and the same dead
+        keyboard follows — reachable by leaving fullscreen on the wall, or by
+        playback stopping while you are on it.
         """
-        target = self.player.surface if self.player_visible else self.list_view
+        if self.player_visible:
+            target = self.player.surface
+        elif self.stack.currentWidget() is self.home_page:
+            target = self.home_page
+        else:
+            target = self.list_view
         target.setFocus(Qt.OtherFocusReason)
 
     def _hide_player_if_idle(self):
@@ -1963,10 +1991,16 @@ class MainWindow(QMainWindow):
         return self.stack.currentWidget() is self.home_page
 
     def open_home(self):
-        """The house icon, and where the app lands."""
+        """The house icon, and where the app lands.
+
+        The wall takes the keyboard so the arrows move its cursor straight away
+        — with nothing playing there is nothing else for them to do, and a wall
+        with no visible cursor looks inert.
+        """
         self._reveal_browser()
         self._show_middle(self.home_page)
         self.refresh_home()
+        self.home_page.setFocus(Qt.OtherFocusReason)
 
     def refresh_home(self):
         """Rebuilt on every visit: Continue Watching moves as you watch."""
