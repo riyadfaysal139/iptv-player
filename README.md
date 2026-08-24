@@ -199,11 +199,17 @@ run out, and it folds away again so browsing gets the width back. It keeps
 whatever width you dragged it to, and `View ▸ Video pane` (`Ctrl+Shift+V`)
 opens or closes it by hand without stopping the stream.
 
+**Once it is on the right, it stays there.** Nothing the app's own navigation
+does takes the video away: the series page and the search results render into
+the items pane beside it, so playing an episode leaves you in the show, and
+`Ctrl+F` mid-episode does not make the picture disappear. Only ⏹ closes it.
+
 ### Master search
 
 The magnifier in the top bar — or `Ctrl+F` / `Cmd+F` from anywhere, including
 fullscreen and Picture-in-Picture — searches **TV, Movies and Series at once**,
-so you do not have to guess which tab a title was filed under. Results appear
+so you do not have to guess which tab a title was filed under. The results fill
+the items pane, so whatever is playing keeps playing beside them. Results appear
 grouped by type in the layout each one normally uses: channel rows with logos
 for TV, poster cells for films and shows. **See all in MOVIES** hands the term
 to that tab's own filter when a section has more than it shows.
@@ -219,15 +225,22 @@ that is how the stored `name_folded` column is built.
 
 ### Series
 
-Opening a show gives it the whole window: its backdrop behind, the poster, and
+Opening a show gives it the items pane: its backdrop behind, the poster, and
 the provider's metadata — director, release date, genre, cast, rating and plot —
-then a row of season buttons and a wrapping grid of episode cards.
+then a row of season buttons and a wrapping grid of episode cards. The category
+sidebar stays where it is, and **playing an episode keeps you on the page** —
+the video docks to the right of it instead of replacing it, so picking the next
+episode is one click, not a trip back through the grid of every show you own.
 
 **Continue watching, per show.** The page remembers the last episode you played
 and opens on its season with a **Continue S01E04 · 12 min in** button that
 resumes where you stopped. Finish an episode and the button moves on to the next
 one, across season boundaries. Part-watched episodes carry a progress bar on
 their card.
+
+⏮ and ⏭ follow what is playing rather than what is on screen: while an episode
+is playing they step through the show, across season boundaries, even after you
+have walked back to the catalog.
 
 Only what the provider sends can be shown, and providers are inconsistent, so
 each field degrades quietly: the backdrop falls back to the cover, an episode
@@ -290,7 +303,7 @@ channel list. Whoever has focus gets them:
   hands focus to the video, so they work straight after you press play, and
   clicking the video gets them back.
 - **The list has focus** — arrows move through channels, as before. Click the
-  list to browse. Closing a full-window page (search, a series) with no video
+  list to browse. Closing a page (search, a series) with no video
   pane on screen hands the keyboard back to the list rather than to the hidden
   video, which would leave the arrows doing nothing at all.
 - **Fullscreen or Picture-in-Picture** — always the player, since there is no
@@ -440,7 +453,7 @@ ui/
   models.py             virtualized model, poster cache, delegates
   player_widget.py      libVLC surface and operations
   search_page.py        master search across every kind
-  series_page.py        full-window series view, resume, wrapping layout
+  series_page.py        series view, resume, wrapping layout
   transport_bar.py      VLC's control bar
   effects_dialog.py     equalizer and video adjustments
   icons.py              painted transport icons

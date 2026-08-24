@@ -1,4 +1,7 @@
-"""The full-window series page: backdrop, metadata, seasons, episode cards.
+"""The series page: backdrop, metadata, seasons, episode cards.
+
+Rendered into the items pane rather than over the window, so the video can sit
+beside it and playing an episode does not take the show away.
 
 Laid out like the reference: a darkened still behind everything, the poster and
 a column of icon-labelled metadata rows, a row of season buttons, and a wrapping

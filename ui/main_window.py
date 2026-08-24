@@ -290,15 +290,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ ui
 
     def _build_ui(self):
-        # Two pages: the catalog (top bar + panes + player) and the full-window
-        # series view. The series page covers everything rather than sitting in
-        # a pane, because Qt widgets cannot draw over libVLC's native video view
-        # - the same constraint that put the fullscreen bar in its own window.
-        self._pages = QStackedWidget()
-        self.setCentralWidget(self._pages)
-
+        # The series page and the master search render into the items pane
+        # rather than over the whole window, so the video can sit beside them
+        # and stay there. A sibling in the splitter never covers libVLC's native
+        # view; only something painting *over* it does, which is still why the
+        # fullscreen control bar is a window of its own.
         central = QWidget()
-        self._pages.addWidget(central)
+        self.setCentralWidget(central)
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -524,7 +522,7 @@ class MainWindow(QMainWindow):
         self.flat_action.toggled.connect(self._toggle_flat)
         view_menu.addAction(self.flat_action)
         view_menu.addAction("Downloads",
-                            lambda: self.stack.setCurrentWidget(self.downloads_panel))
+                            lambda: self._show_middle(self.downloads_panel))
         view_menu.addSeparator()
 
         # VLC hides the record/snapshot/A-B row behind the same menu item.
@@ -826,7 +824,9 @@ class MainWindow(QMainWindow):
             self.list_view.setSpacing(4)
         else:
             self.list_view.setSpacing(0)
-        self.stack.setCurrentWidget(self.list_view)
+        # Changing tab leaves the series page or the search results behind, the
+        # same way picking a category does.
+        self._show_middle(self.list_view)
         self.reload_catalog()
 
     def _category_filter(self, text):
@@ -840,12 +840,24 @@ class MainWindow(QMainWindow):
         if self.playlist is None:
             return
         if node_type == "downloads":
-            self.stack.setCurrentWidget(self.downloads_panel)
+            self._show_middle(self.downloads_panel)
             self.downloads_panel.refresh()
             return
-        self.stack.setCurrentWidget(self.list_view)
+        self._show_middle(self.list_view)
         self._current_filter = (node_type, payload)
         self.apply_item_filter()
+
+    def _show_middle(self, widget):
+        """Swap what the items pane shows.
+
+        Four things live in that pane now — the catalog list, the downloads, the
+        series page and the master search. The last two bring their own header
+        (a back arrow, and the search field itself), so the pane's own filter box
+        is hidden for them rather than sitting above a page it cannot filter.
+        """
+        self.stack.setCurrentWidget(widget)
+        self.item_search.setVisible(
+            widget not in (self.series_page, self.search_page))
 
     def _schedule_item_filter(self):
         self._filter_timer.start()
@@ -1024,7 +1036,12 @@ class MainWindow(QMainWindow):
             self.player.stop()
 
     def replay_current(self):
-        if self._current_item is not None and self.stack.currentIndex() != 1:
+        # The episode first: open_series() leaves _current_item pointing at the
+        # *series* row, so replaying that would ask for a VOD URL built from a
+        # series id and get nothing back.
+        if self._current_episode is not None:
+            self._play_episode(self._current_episode)
+        elif self._current_item is not None:
             self.play_item(self._current_item)
         elif self.player.current_url:
             self.player.play(self.player.current_url, self.player.current_title,
@@ -1033,8 +1050,13 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------- prev / next
 
     def step_item(self, delta: int):
-        """The bar's ⏮ / ⏭, over whichever list the user is looking at."""
-        if self.stack.currentIndex() == 1:
+        """The bar's ⏮ / ⏭, over whatever is playing.
+
+        Keyed off the episode rather than off what the items pane happens to be
+        showing: "next" means the next episode for as long as an episode is what
+        you are watching, whether or not you have since walked back to the list.
+        """
+        if self._current_episode is not None:
             self._step_episode(delta)
             return
         count = self.model.rowCount()
@@ -1107,6 +1129,21 @@ class MainWindow(QMainWindow):
         self._middle_pane.setVisible(visible)
         if visible and self._browser_sizes:
             self._splitter.setSizes(self._browser_sizes)
+
+    def _reveal_browser(self):
+        """Make sure the items pane is actually on screen before rendering into it.
+
+        The series page and the master search live in that pane now, so three
+        states hide it from underneath them: fullscreen, Picture-in-Picture, and
+        Ctrl+L. Opening either page has to undo whichever is in force, or the
+        page renders somewhere nobody can see.
+        """
+        if self._fs_state:
+            self.exit_fullscreen()
+        if self._pip_state:
+            self.exit_pip()
+        if not self._middle_pane.isVisible():
+            self.browser_action.setChecked(True)    # drives set_browser_visible
 
     # -------------------------------------------------------- video pane
 
@@ -1267,10 +1304,9 @@ class MainWindow(QMainWindow):
             return
         if self._pip_state:
             self.exit_pip()
-        if self.series_open:
-            self.close_series()
-        if self.search_open:
-            self.close_search()
+        # The series page and the search are inside the items pane, which
+        # _hide_chrome hides wholesale — leaving fullscreen puts you back on
+        # whichever of them you were reading.
         self._fs_state = self._save_chrome()
         self._right_pane.show()     # the video lives in it; saved state puts it back
         self._hide_chrome()
@@ -1395,10 +1431,8 @@ class MainWindow(QMainWindow):
             return
         if self._fs_state:
             self.exit_fullscreen()
-        if self.series_open:
-            self.close_series()
-        if self.search_open:
-            self.close_search()
+        # As in fullscreen: the pages live in the items pane, which _hide_chrome
+        # takes away and _restore_chrome gives back exactly as it was.
 
         state = self._save_chrome()
         state["flags"] = self.windowFlags()
@@ -1707,7 +1741,7 @@ class MainWindow(QMainWindow):
         self.search_page.resultActivated.connect(self._activate_result)
         self.search_page.seeAllRequested.connect(self._see_all)
         self.search_page.searchRequested.connect(self._schedule_master_search)
-        self._pages.addWidget(self.search_page)
+        self.stack.addWidget(self.search_page)
 
         self._master_timer = QTimer(self)
         self._master_timer.setSingleShot(True)
@@ -1716,28 +1750,21 @@ class MainWindow(QMainWindow):
 
     @property
     def search_open(self) -> bool:
-        return self._pages.currentWidget() is self.search_page
+        return self.stack.currentWidget() is self.search_page
 
     def open_search(self):
         """The magnifier and Ctrl+F, from wherever you happen to be."""
         if self.search_open:
             self.search_page.focus_field()
             return
-        # The page owns the window, so the other modes have to give it up -
-        # the same rule fullscreen, PiP and the series page already apply.
-        if self._fs_state:
-            self.exit_fullscreen()
-        if self._pip_state:
-            self.exit_pip()
-        if self.series_open:
-            self.close_series()
-        self._pages.setCurrentWidget(self.search_page)
+        self._reveal_browser()
+        self._show_middle(self.search_page)
         self.search_page.focus_field()
         self._run_master_search()
 
     def close_search(self):
         self._master_timer.stop()
-        self._pages.setCurrentIndex(0)
+        self._show_middle(self.list_view)
         self._return_focus()
 
     def _schedule_master_search(self, _term=""):
@@ -1791,14 +1818,14 @@ class MainWindow(QMainWindow):
         self.series_page.backRequested.connect(self.close_series)
         self.series_page.episodeActivated.connect(self._play_episode)
         self.series_page.episodeMenuRequested.connect(self._episode_menu)
-        self._pages.addWidget(self.series_page)
+        self.stack.addWidget(self.series_page)
 
     @property
     def series_open(self) -> bool:
-        return self._pages.currentWidget() is self.series_page
+        return self.stack.currentWidget() is self.series_page
 
     def close_series(self):
-        self._pages.setCurrentIndex(0)
+        self._show_middle(self.list_view)
         self._return_focus()
 
     EPISODE_COLUMNS = ("season, episode_num, episode_id, title, "
@@ -1845,13 +1872,9 @@ class MainWindow(QMainWindow):
     def open_series(self, row):
         self._current_item = row
         self._current_series = row
-        # The page owns the whole window, so the other window modes have to go.
-        if self._fs_state:
-            self.exit_fullscreen()
-        if self._pip_state:
-            self.exit_pip()
+        self._reveal_browser()
         self.series_page.set_loading(row[1])
-        self._pages.setCurrentWidget(self.series_page)
+        self._show_middle(self.series_page)
         self.now_title.setText(row[1])
 
         episodes = self._episode_rows(row[0])
@@ -1905,9 +1928,8 @@ class MainWindow(QMainWindow):
         self.series_page.note_played(episode)
         self.now_title.setText(title)
         self.live_badge.hide()
-        # Back to the catalog page: the player lives there, and playing into a
-        # hidden widget would leave you looking at the series page.
-        self.close_series()
+        # The page stays. The video docks beside it, so playing episode four no
+        # longer throws you back to the grid of every show you own.
         self._idle_timer.stop()
         self.set_player_visible(True)
         self.player.play(url, title, is_live=False, resume_secs=int(resume_secs or 0))
