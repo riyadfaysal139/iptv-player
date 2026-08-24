@@ -64,6 +64,12 @@ QTabBar::tab {
 }
 QTabBar::tab:selected { color: #f5d90a; border-bottom: 2px solid #f5d90a; }
 QTabBar::tab:hover:!selected { color: #c6cdea; }
+/* Off the tabs entirely — on the homepage or in the master search — nothing
+   here is where you are, so nothing here is lit. */
+QTabBar[lit="false"]::tab:selected {
+    color: #8e97c4;
+    border-bottom: 2px solid transparent;
+}
 QTabWidget::pane { border: none; }
 
 /* ---------- buttons ---------- */
@@ -372,6 +378,14 @@ QPushButton#masterSearchButton, QPushButton#topBarButton {
 }
 QPushButton#masterSearchButton:hover,
 QPushButton#topBarButton:hover { background-color: #101841; }
+/* The page you are on. The icon's accent artwork is swapped in code, because
+   a stylesheet cannot recolour a pixmap. */
+QPushButton#masterSearchButton[on="true"],
+QPushButton#topBarButton[on="true"] {
+    background-color: #16204f;
+    border-bottom: 2px solid #f5d90a;
+    border-radius: 4px;
+}
 
 QWidget#searchPage, QWidget#searchBody, QScrollArea#searchScroll,
 QScrollArea#searchScroll > QWidget > QWidget,

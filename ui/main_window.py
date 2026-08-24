@@ -58,6 +58,7 @@ PIP_MARGIN = 24
 PLAYER_PANE_WIDTH = 540
 MIN_MIDDLE_WIDTH = 260         # a poster column plus its scrollbar
 MIN_LEFT_WIDTH = 180           # enough for a category name
+SIDEBAR_WIDTH = 330            # what the category pane opens at
 PLAYER_HIDE_DELAY_MS = 400     # past SWITCH_DEBOUNCE_MS, so a queued switch wins
 UP_NEXT_SECONDS = 10           # Netflix's countdown, near enough
 
@@ -236,6 +237,7 @@ class MainWindow(QMainWindow):
         self._cursor_hidden = False
         self._effects_dialog = None
         self._browser_sizes = None
+        self._sidebar_width = SIDEBAR_WIDTH   # what it opens back at
         self._player_width = PLAYER_PANE_WIDTH
         self._fs_overlay = None
         self._pip_state = None
@@ -359,6 +361,11 @@ class MainWindow(QMainWindow):
         for _, label in TABS:
             self.tab_bar.addTab(label)
         self.tab_bar.currentChanged.connect(self._tab_changed)
+        # currentChanged does not fire for a click on the tab already selected,
+        # which used to be harmless — you were looking at that list anyway. Now
+        # the homepage can be in the pane with the tab dimmed to say so, and
+        # clicking it has to take you there.
+        self.tab_bar.tabBarClicked.connect(self._tab_clicked)
         top_layout.addWidget(self.tab_bar)
         outer.addWidget(top)
 
@@ -481,7 +488,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(info, 2)
         splitter.addWidget(right)
 
-        splitter.setSizes([330, 660, PLAYER_PANE_WIDTH])
+        splitter.setSizes([SIDEBAR_WIDTH, 660, PLAYER_PANE_WIDTH])
         splitter.setStretchFactor(1, 1)
         # Nothing is playing yet, so the catalog gets the whole window. Hidden
         # after setSizes so the splitter still knows the width to open it at.
@@ -853,6 +860,10 @@ class MainWindow(QMainWindow):
     def invalidate_client(self):
         self._client_cache = None
 
+    def _tab_clicked(self, index):
+        if self.tab_bar.currentIndex() == index:
+            self._tab_changed(index)
+
     def _tab_changed(self, index):
         self.kind = TABS[index][0]
         self.item_search.setPlaceholderText(
@@ -904,6 +915,73 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(widget)
         self.item_search.setVisible(
             widget not in (self.series_page, self.search_page, self.home_page))
+        self._sync_chrome()
+
+    def _sync_chrome(self):
+        """Make the top bar and the sidebar agree with what the pane is showing.
+
+        The homepage and the master search do not belong to a tab, so nothing
+        should be lit but the button for the page you are actually on — and the
+        category sidebar, which lists one tab's catalog, has nothing to say
+        about the homepage at all.
+        """
+        on_home = self.home_open
+        on_search = self.search_open
+        self._light(self.home_button, on_home, glyph="home")
+        self._light(self.search_button, on_search, glyph="search")
+        self._light(self.tab_bar, not (on_home or on_search), name="lit")
+        self._sync_sidebar()
+
+    @staticmethod
+    def _light(widget, on: bool, name: str = "on", glyph: str = ""):
+        """Flip a style property and repolish, since Qt does not re-read it.
+
+        A stylesheet cannot recolour a pixmap, so an icon button is handed the
+        accent artwork here rather than in the theme.
+        """
+        if widget.property(name) == bool(on):
+            return
+        widget.setProperty(name, bool(on))
+        if glyph:
+            widget.setIcon(icons.icon(glyph, 19,
+                                      icons.ACCENT if on else icons.FG))
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+    def _sync_sidebar(self):
+        """The sidebar steps aside for the homepage, and comes back after it.
+
+        Only the left/items split is touched on the way back. Restoring the
+        whole saved triple instead would collapse the video pane to nothing
+        whenever something started playing while the homepage was up.
+        """
+        if self._fs_state or self._pip_state:
+            return              # those two own pane visibility
+        wanted = self.browser_action.isChecked() and not self.home_open
+        # isVisibleTo, not isVisible: during construction the window has not
+        # been shown, so isVisible() is False for every child and this would
+        # "restore" the panes against a splitter that has no geometry yet -
+        # which left the sidebar at its 60px minimum instead of 330.
+        if wanted == self._left_pane.isVisibleTo(self._splitter):
+            return
+        if not wanted:
+            # Only trust a width the user could plausibly have dragged to.
+            # Before the window is shown the splitter normalises every pane to
+            # its minimum, and harvesting that 60px once made the sidebar
+            # reopen at its minimum from then on.
+            measured = self._splitter.sizes()[0]
+            if measured >= MIN_LEFT_WIDTH:
+                self._sidebar_width = measured
+        self._left_pane.setVisible(wanted)
+        if wanted:
+            current = self._splitter.sizes()
+            width = min(self._sidebar_width,
+                        max(0, current[1] - MIN_MIDDLE_WIDTH))
+            # Deliver the pending LayoutRequest before setting sizes: a child
+            # that has only just been shown still measures 0, and the splitter
+            # recomputes over the top of anything set before it has caught up.
+            QApplication.sendPostedEvents(None, QEvent.LayoutRequest)
+            self._splitter.setSizes([width, current[1] - width, current[2]])
 
     def _schedule_item_filter(self):
         self._filter_timer.start()
@@ -1248,7 +1326,8 @@ class MainWindow(QMainWindow):
             return
         if not visible and self._left_pane.isVisible():
             self._browser_sizes = self._splitter.sizes()
-        self._left_pane.setVisible(visible)
+        # The sidebar answers to the homepage rule as well as to this toggle.
+        self._left_pane.setVisible(visible and not self.home_open)
         self._middle_pane.setVisible(visible)
         if visible and self._browser_sizes:
             self._splitter.setSizes(self._browser_sizes)
@@ -2038,10 +2117,11 @@ class MainWindow(QMainWindow):
                 continue
             if self.tab_bar.currentIndex() != index:
                 self.tab_bar.setCurrentIndex(index)     # drives _tab_changed
-            elif self.kind != kind:
-                # Already on the tab but self.kind disagrees. Nothing should
-                # make them diverge, but self.kind is what playback builds its
-                # URL from, so re-sync rather than trust the invariant.
+            elif (self.kind != kind
+                    or self.stack.currentWidget() is not self.list_view):
+                # Already on the tab, but either self.kind disagrees — and that
+                # is what playback builds its URL from — or a page is covering
+                # the list, in which case "go to this tab" still has work to do.
                 self._tab_changed(index)
             return
 

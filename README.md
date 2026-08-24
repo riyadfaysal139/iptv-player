@@ -184,6 +184,12 @@ Double-click plays, and **leaves you on the homepage** with the video docked
 beside it; only a show takes you away, to its own page. **See all** on a row
 hands over to the sidebar node it corresponds to.
 
+The homepage does not belong to a tab, so while it is up the house icon is the
+only thing lit, TV/MOVIES/SERIES go grey, and the category sidebar — which lists
+one tab's catalog — steps aside and gives the wall the full width. Clicking any
+tab brings all three back, **including the tab already selected**: it is where
+you would land, so it has to work.
+
 **Pin your own.** Any sidebar group or category can be added to the homepage:
 hover the row and click the pin, or right-click it and choose *Add to
 homepage*. `BANGLA` under Movies — 385 films across five categories, nowhere
