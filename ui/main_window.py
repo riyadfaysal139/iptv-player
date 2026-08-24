@@ -31,7 +31,9 @@ from ui import icons
 from ui.category_tree import CategoryTree, build_groups
 from ui.downloads_panel import DownloadsPanel
 from ui.effects_dialog import EffectsDialog, load_saved_effects
-from ui.home_page import HomePage, home_sections
+from ui.home_page import (
+    HomePage, home_sections, is_pinned, pin_keys, pin_rail, unpin_rail,
+)
 from ui.models import (
     ROLE_ITEM, CatalogModel, ChannelDelegate, ImageCache, PosterDelegate,
 )
@@ -377,6 +379,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.category_search)
         self.tree = CategoryTree()
         self.tree.nodeSelected.connect(self.on_node_selected)
+        self.tree.pinToggled.connect(self.toggle_home_pin)
+        self.tree.menuRequested.connect(self._category_menu)
         left_layout.addWidget(self.tree, 1)
         splitter.addWidget(left)
 
@@ -778,6 +782,9 @@ class MainWindow(QMainWindow):
             groups.append(("Uncategorized", orphans, [("__orphans__", "Uncategorized", orphans)]))
 
         self.tree.set_flat(self.db.get_bool("flat_categories", False))
+        # Before load(), which is what rebuilds the rows carrying the glyph.
+        self.tree.set_home_pins(pin_keys(self.db, self.playlist.id), self.kind,
+                                rebuild=False)
         self.tree.load(groups, totals)
         self.tree.select_first()
 
@@ -1869,6 +1876,7 @@ class MainWindow(QMainWindow):
         self.home_page = HomePage(self.images)
         self.home_page.itemActivated.connect(self._activate_home)
         self.home_page.seeAllRequested.connect(self._see_all_rail)
+        self.home_page.unpinRequested.connect(self._unpin_rail)
         self.stack.addWidget(self.home_page)
 
     @property
@@ -1906,6 +1914,55 @@ class MainWindow(QMainWindow):
             self.open_series(row)
             return
         self.play_item(row, kind=kind)
+
+    def toggle_home_pin(self, node_type: str, payload, title: str):
+        """Put a sidebar group or category on the homepage, or take it off.
+
+        The pin lives in three places at once — the table, the sidebar glyph and
+        the wall — so every route in comes through here rather than each caller
+        remembering to update the other two.
+        """
+        if self.playlist is None or node_type not in ("group", "category"):
+            return
+        pinned = is_pinned(self.db, self.playlist.id, self.kind, node_type, payload)
+        if pinned:
+            unpin_rail(self.db, self.playlist.id, self.kind, node_type, payload)
+        else:
+            pin_rail(self.db, self.playlist.id, self.kind, node_type, payload,
+                     title or str(payload))
+        self._refresh_home_pins()
+        self.statusBar().showMessage(
+            f"{'Removed' if pinned else 'Added'} “{title}” "
+            f"{'from' if pinned else 'to'} the homepage", 4000)
+
+    def _unpin_rail(self, target):
+        """The ✕ on a pinned rail, which knows its own kind."""
+        kind, node_type, payload = target
+        if self.playlist is None:
+            return
+        unpin_rail(self.db, self.playlist.id, kind, node_type, payload)
+        self._refresh_home_pins()
+
+    def _refresh_home_pins(self):
+        """Put the sidebar glyph and the wall back in step with the table."""
+        if self.playlist is None:
+            return
+        self.tree.set_home_pins(pin_keys(self.db, self.playlist.id), self.kind)
+        if self.home_open:
+            self.refresh_home()
+
+    def _category_menu(self, node_type: str, payload, title: str, position):
+        menu = QMenu(self)
+        menu.addAction("Show", lambda: self.on_node_selected(node_type, payload))
+        if node_type in ("group", "category") and self.playlist is not None:
+            pinned = is_pinned(self.db, self.playlist.id, self.kind,
+                               node_type, payload)
+            menu.addSeparator()
+            menu.addAction(
+                "Remove from homepage" if pinned else "Add to homepage",
+                lambda: self.toggle_home_pin(node_type, payload, title),
+            )
+        menu.exec(position)
 
     def _see_all_rail(self, target):
         """A rail's "See all", handed to the sidebar node it corresponds to.

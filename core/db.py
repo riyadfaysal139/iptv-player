@@ -154,6 +154,19 @@ CREATE TABLE IF NOT EXISTS history (
     PRIMARY KEY (playlist_id, kind, stream_id, episode_id)
 );
 
+-- Categories and groups the user has pinned to the homepage. Arrives in an
+-- existing database on the next open, the same way series_info did: the whole
+-- schema is CREATE TABLE IF NOT EXISTS and runs every time.
+CREATE TABLE IF NOT EXISTS home_rails (
+    playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,          -- live | movie | series
+    node_type   TEXT NOT NULL,          -- group | category
+    payload     TEXT NOT NULL,          -- group_name | category_id
+    title       TEXT NOT NULL,          -- the heading, as it read when pinned
+    pinned_at   INTEGER,
+    PRIMARY KEY (playlist_id, kind, node_type, payload)
+);
+
 CREATE TABLE IF NOT EXISTS collections (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,

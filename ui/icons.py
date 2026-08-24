@@ -211,6 +211,14 @@ def _home(p, c):
     p.drawLine(QPointF(58, 62), QPointF(58, 86))
 
 
+def _pin(p, c):
+    """A drawing pin seen head-on: round head, shaft, point."""
+    _fill(p, c)
+    p.drawEllipse(QPointF(50, 34), 24, 24)
+    _stroke(p, c, 9, Qt.RoundCap)
+    p.drawLine(QPointF(50, 58), QPointF(50, 90))
+
+
 def _director(p, c):
     """A megaphone — the reference's glyph for the director row."""
     _fill(p, c)
@@ -335,6 +343,7 @@ SHAPES = {
     "back": _back,
     "search": _search,
     "home": _home,
+    "pin": _pin,
     "director": _director,
     "calendar": _calendar,
     "genre": _genre,

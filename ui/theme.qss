@@ -200,6 +200,11 @@ QLabel#railHeading {
     font-weight: 700;
     letter-spacing: 1px;
 }
+QPushButton#unpinButton {
+    background: transparent; border: none;
+    color: #7b84b4; font-size: 13px; padding: 2px 6px;
+}
+QPushButton#unpinButton:hover { color: #ff6b6b; }
 QLabel#homeEmpty {
     background: transparent;
     color: #8e97c4;

@@ -1375,6 +1375,164 @@ class TestHomeSections(unittest.TestCase):
         self.assertEqual(keys[1], "favourites")
 
 
+class TestPinnedRails(unittest.TestCase):
+    """Categories the user pins to the homepage.
+
+    The motivating case is a *group*: Bangla is five categories and 385 films,
+    nowhere near the top five genres, so the wall would never mention it.
+    """
+
+    def setUp(self):
+        import tempfile
+        import time
+
+        from ui.home_page import (
+            home_sections, is_pinned, pin_keys, pin_rail, pinned_rails, unpin_rail,
+        )
+
+        self.build = home_sections
+        self.pin = pin_rail
+        self.unpin = unpin_rail
+        self.pinned = pinned_rails
+        self.keys = pin_keys
+        self.is_pinned = is_pinned
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = Database(self.dir / "t.sqlite")
+        for playlist in (1, 2):
+            self.db.execute(
+                "INSERT INTO playlists(id, name, type, position) VALUES(?,?,'xtream',0)",
+                (playlist, f"p{playlist}"))
+        self.now = int(time.time())
+
+    def tearDown(self):
+        import shutil
+
+        self.db.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def add(self, kind, stream_id, name, category, playlist=1):
+        self.db.execute(
+            "INSERT INTO streams(playlist_id, kind, stream_id, name, name_folded,"
+            " available, dup_rank, category_id, added) VALUES(?,?,?,?,?,1,1,?,?)",
+            (playlist, kind, stream_id, name, fold(name), category, self.now),
+        )
+
+    def category(self, kind, category_id, sub_name, group, count=100, playlist=1):
+        self.db.execute(
+            "INSERT INTO categories(playlist_id, kind, category_id, name,"
+            " group_name, sub_name, item_count) VALUES(?,?,?,?,?,?,?)",
+            (playlist, kind, category_id, sub_name, group, sub_name, count),
+        )
+
+    def bangla(self, playlist=1):
+        """The user's own example: a group of several categories."""
+        for index, (category_id, name) in enumerate(
+                (("c1", "Bangla Modern"), ("c2", "Bangla Trending"))):
+            self.category("movie", category_id, name, "Bangla", playlist=playlist)
+            for n in range(4):
+                self.add("movie", f"{category_id}-{n}", f"{name} {n}", category_id,
+                         playlist=playlist)
+
+    def sections(self, playlist=1):
+        return {key: (title, rows, kinds, target)
+                for key, title, rows, kinds, target in self.build(self.db, playlist)}
+
+    # -- the table ----------------------------------------------------------
+
+    def test_pin_and_unpin_round_trip(self):
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        self.assertTrue(self.is_pinned(self.db, 1, "movie", "group", "Bangla"))
+        self.assertEqual(self.pinned(self.db, 1),
+                         [("movie", "group", "Bangla", "Bangla")])
+        self.unpin(self.db, 1, "movie", "group", "Bangla")
+        self.assertFalse(self.is_pinned(self.db, 1, "movie", "group", "Bangla"))
+        self.assertEqual(self.pinned(self.db, 1), [])
+
+    def test_pinning_twice_does_not_duplicate(self):
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla renamed")
+        rows = self.pinned(self.db, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], "Bangla renamed")
+
+    def test_the_same_name_under_two_kinds_is_two_pins(self):
+        self.pin(self.db, 1, "movie", "group", "Sports", "Sports")
+        self.pin(self.db, 1, "live", "group", "Sports", "Sports")
+        self.assertEqual(len(self.pinned(self.db, 1)), 2)
+
+    def test_pins_are_per_playlist(self):
+        self.pin(self.db, 1, "movie", "category", "c1", "One")
+        self.assertEqual(self.pinned(self.db, 2), [])
+        self.assertFalse(self.is_pinned(self.db, 2, "movie", "category", "c1"))
+
+    def test_keys_are_what_the_sidebar_lights(self):
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        self.assertEqual(self.keys(self.db, 1), {("movie", "group", "Bangla")})
+
+    # -- the rails ----------------------------------------------------------
+
+    def test_a_pinned_group_becomes_a_rail(self):
+        self.bangla()
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        title, rows, kinds, target = self.sections()["pin_movie_group_Bangla"]
+        self.assertEqual(title, "BANGLA")
+        self.assertEqual(len(rows), 8)          # both categories in the group
+        self.assertEqual(set(kinds), {"movie"})
+        self.assertEqual(target, ("movie", "group", "Bangla"))
+
+    def test_a_pinned_category_becomes_a_rail(self):
+        self.bangla()
+        self.pin(self.db, 1, "movie", "category", "c1", "Bangla Modern")
+        title, rows, _kinds, target = self.sections()["pin_movie_category_c1"]
+        self.assertEqual(title, "BANGLA MODERN")
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(target, ("movie", "category", "c1"))
+
+    def test_a_small_pinned_rail_is_kept(self):
+        """MIN_RAIL drops generated gaps; a rail you asked for is not a gap."""
+        self.category("movie", "tiny", "Tiny", "Odds")
+        self.add("movie", "t1", "Only One", "tiny")
+        self.pin(self.db, 1, "movie", "category", "tiny", "Tiny")
+        self.assertIn("pin_movie_category_tiny", self.sections())
+
+    def test_pinned_rails_sit_after_your_history_and_before_the_guesses(self):
+        self.bangla()
+        self.db.execute(
+            "INSERT INTO history(playlist_id, kind, stream_id, episode_id,"
+            " position_secs, duration_secs, watched_at) VALUES(1,'movie','c1-0','',6,60,?)",
+            (self.now,))
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        keys = [key for key, _t, _r, _k, _ta in self.build(self.db, 1)]
+        self.assertEqual(keys[0], "continue")
+        self.assertEqual(keys[1], "pin_movie_group_Bangla")
+        self.assertTrue(keys[2].startswith("new_"), keys[2])
+
+    def test_a_pinned_rail_survives_the_cap(self):
+        from ui.home_page import MAX_RAILS
+
+        self.bangla()
+        self.pin(self.db, 1, "movie", "group", "Bangla", "Bangla")
+        for n in range(MAX_RAILS + 6):
+            self.category("movie", f"g{n}", f"Genre {n}", "Genres", count=1000 - n)
+            for m in range(8):
+                self.add("movie", f"g{n}i{m}", f"G{n} {m}", f"g{n}")
+        keys = [key for key, _t, _r, _k, _ta in self.build(self.db, 1)]
+        self.assertIn("pin_movie_group_Bangla", keys)
+
+    def test_a_pinned_genre_does_not_appear_twice(self):
+        self.category("movie", "h1", "Horror", "Genres", count=900)
+        for n in range(8):
+            self.add("movie", f"h{n}", f"Horror {n}", "h1")
+        self.pin(self.db, 1, "movie", "category", "h1", "Horror")
+        titles = [title for _k, title, _r, _ki, _t in self.build(self.db, 1)]
+        self.assertEqual(titles.count("HORROR"), 1)
+
+    def test_a_pin_the_provider_dropped_yields_no_rail_but_keeps_the_pin(self):
+        self.pin(self.db, 1, "movie", "category", "gone", "Gone")
+        self.assertFalse([k for k in self.sections() if k.startswith("pin_")])
+        self.assertTrue(self.is_pinned(self.db, 1, "movie", "category", "gone"))
+
+
 class TestCatalogModelKinds(unittest.TestCase):
     """Per-item kinds, which the mixed homepage rails need."""
 

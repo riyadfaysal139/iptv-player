@@ -40,6 +40,50 @@ def _rows(db, sql, params):
     return [tuple(r) for r in db.query(sql, params)]
 
 
+# --------------------------------------------------------------------------
+# categories the user has pinned
+# --------------------------------------------------------------------------
+
+
+def pin_rail(db, playlist_id, kind: str, node_type: str, payload: str, title: str):
+    """Pin a sidebar group or category to the homepage. Idempotent."""
+    db.execute(
+        "INSERT INTO home_rails(playlist_id, kind, node_type, payload, title,"
+        " pinned_at) VALUES(?,?,?,?,?,?)"
+        " ON CONFLICT(playlist_id, kind, node_type, payload) DO UPDATE SET"
+        " title=excluded.title",
+        (playlist_id, kind, node_type, str(payload), title, int(time.time())),
+    )
+
+
+def unpin_rail(db, playlist_id, kind: str, node_type: str, payload: str):
+    db.execute(
+        "DELETE FROM home_rails WHERE playlist_id=? AND kind=? AND node_type=?"
+        " AND payload=?",
+        (playlist_id, kind, node_type, str(payload)),
+    )
+
+
+def pinned_rails(db, playlist_id):
+    """Everything pinned, oldest first: [(kind, node_type, payload, title)]."""
+    return [(r["kind"], r["node_type"], r["payload"], r["title"])
+            for r in db.query(
+                "SELECT kind, node_type, payload, title FROM home_rails"
+                " WHERE playlist_id=? ORDER BY pinned_at, rowid",
+                (playlist_id,),
+            )]
+
+
+def pin_keys(db, playlist_id) -> set:
+    """What the sidebar needs to know to light its pins."""
+    return {(kind, node_type, payload)
+            for kind, node_type, payload, _title in pinned_rails(db, playlist_id)}
+
+
+def is_pinned(db, playlist_id, kind: str, node_type: str, payload: str) -> bool:
+    return (kind, node_type, str(payload)) in pin_keys(db, playlist_id)
+
+
 def _personal(db, playlist_id, table, order_column, cap):
     """Continue Watching and Favourites: small tables, joined the fast way.
 
@@ -163,6 +207,19 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
             out.append((key, title, [r[:-1] for r in rows],
                         [r[-1] for r in rows], None))
 
+    # Your choices, after your history and before anything the app guessed.
+    pinned_targets = set()
+    for kind, node_type, payload, title in pinned_rails(db, playlist_id):
+        pinned_targets.add((kind, node_type, payload))
+        if node_type == "group":
+            rows = _by_group(db, playlist_id, kind, payload, cap, "s.added DESC")
+        else:
+            rows = _by_category(db, playlist_id, kind, payload, cap)
+        if rows:
+            # No MIN_RAIL here: a small rail you asked for is not a gap.
+            out.append((f"pin_{kind}_{node_type}_{payload}", title.upper(), rows,
+                        [kind] * len(rows), (kind, node_type, payload)))
+
     for key, kind, title in (("new_movie", "movie", "NEW MOVIES"),
                              ("new_series", "series", "NEW SERIES"),
                              ("new_live", "live", "NEW CHANNELS")):
@@ -179,6 +236,8 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
                         ["live"] * len(rows), ("live", "group", group)))
 
     for kind, category_id, name in _genres(db, playlist_id, genres):
+        if (kind, "category", category_id) in pinned_targets:
+            continue        # already on the wall by choice; twice is confusing
         rows = _by_category(db, playlist_id, kind, category_id, cap)
         if len(rows) >= MIN_RAIL:
             # Films get the bare genre name; shows are marked, because the two
@@ -188,9 +247,12 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
             out.append((f"genre_{kind}_{category_id}", title, rows,
                         [kind] * len(rows), (kind, "category", category_id)))
 
-    # The personal rails always stay; the cap trims the tail of the wall.
-    keep = [s for s in out if s[0] in ("continue", "favourites")]
-    return keep + [s for s in out if s not in keep][:MAX_RAILS - len(keep)]
+    # Your history and your pins always stay: the cap exists to trim what the
+    # app guessed, never what you asked for.
+    keep = [s for s in out
+            if s[0] in ("continue", "favourites") or s[0].startswith("pin_")]
+    generated = [s for s in out if s not in keep]
+    return keep + generated[:max(0, MAX_RAILS - len(keep))]
 
 
 # --------------------------------------------------------------------------
@@ -203,6 +265,7 @@ class HomeRail(QWidget):
 
     activated = Signal(str, object)      # kind, row
     seeAllRequested = Signal(object)     # (kind, node_type, payload)
+    unpinRequested = Signal(object)      # (kind, node_type, payload)
 
     def __init__(self, key: str, title: str, images, parent=None):
         super().__init__(parent)
@@ -223,8 +286,16 @@ class HomeRail(QWidget):
         self.see_all.setCursor(Qt.PointingHandCursor)
         self.see_all.setFocusPolicy(Qt.NoFocus)
         self.see_all.clicked.connect(self._see_all_clicked)
+        self.unpin = QPushButton("✕ Remove")
+        self.unpin.setObjectName("unpinButton")
+        self.unpin.setCursor(Qt.PointingHandCursor)
+        self.unpin.setFocusPolicy(Qt.NoFocus)
+        self.unpin.setToolTip("Take this off the homepage")
+        self.unpin.clicked.connect(self._unpin_clicked)
+        self.unpin.hide()
         header.addWidget(self.heading)
         header.addWidget(self.see_all)
+        header.addWidget(self.unpin)
         header.addStretch(1)
         box.addLayout(header)
 
@@ -258,14 +329,21 @@ class HomeRail(QWidget):
         if self.target is not None:
             self.seeAllRequested.emit(self.target)
 
-    def set_target(self, target):
+    def _unpin_clicked(self):
+        if self.target is not None:
+            self.unpinRequested.emit(self.target)
+
+    def set_target(self, target, pinned: bool = False):
         """Where "See all" goes, or None to hide the link.
 
         The two personal rails have none: their sidebar equivalents are per-kind
-        and the rail is mixed, so there is no one node to send you to.
+        and the rail is mixed, so there is no one node to send you to. `pinned`
+        adds the way back out, because unpinning from the thing you are looking
+        at is more obvious than hunting for it in the sidebar again.
         """
         self.target = target
         self.see_all.setVisible(target is not None)
+        self.unpin.setVisible(bool(pinned) and target is not None)
 
     def set_rows(self, rows, kinds):
         self.model.set_rows(rows, kinds[0] if kinds else "movie", set(), kinds)
@@ -280,6 +358,7 @@ class HomePage(QWidget):
 
     itemActivated = Signal(str, object)      # kind, row
     seeAllRequested = Signal(object)         # (kind, node_type, payload)
+    unpinRequested = Signal(object)          # (kind, node_type, payload)
 
     def __init__(self, images, parent=None):
         super().__init__(parent)
@@ -331,9 +410,10 @@ class HomePage(QWidget):
                 rail = HomeRail(key, title, self.images)
                 rail.activated.connect(self.itemActivated)
                 rail.seeAllRequested.connect(self.seeAllRequested)
+                rail.unpinRequested.connect(self.unpinRequested)
                 self.rails[key] = rail
             rail.heading.setText(title)
-            rail.set_target(target)
+            rail.set_target(target, pinned=key.startswith("pin_"))
             rail.set_rows(rows, kinds)
             # Insert before the trailing stretch, in the order given.
             self.root.insertWidget(position + 1, rail)

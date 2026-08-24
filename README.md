@@ -184,6 +184,17 @@ Double-click plays, and **leaves you on the homepage** with the video docked
 beside it; only a show takes you away, to its own page. **See all** on a row
 hands over to the sidebar node it corresponds to.
 
+**Pin your own.** Any sidebar group or category can be added to the homepage:
+hover the row and click the pin, or right-click it and choose *Add to
+homepage*. `BANGLA` under Movies — 385 films across five categories, nowhere
+near the top five genres — becomes a row of its own, sitting after your history
+and before anything the app guessed. Pinned rows are never trimmed by the cap
+and never dropped for being small: a row you asked for is not a gap. The pin
+stays lit in the sidebar so what is on the homepage is visible at a glance, and
+**✕ Remove** on the row itself takes it off again. Pins are stored per playlist,
+and pinning a genre suppresses the app's own version of it rather than showing
+the heading twice.
+
 The personal rows are the reason the queries are shaped the way they are. Joined
 the obvious way — 93,000 `streams` rows against a grouped `history` subquery —
 SQLite drives from `streams` and the row costs **57 ms warm, a full second
@@ -493,7 +504,7 @@ core/
   vlc_setup.py          libVLC discovery and loading
 ui/
   main_window.py        pane layout, tabs, the video pane's reveal
-  category_tree.py      grouped sidebar
+  category_tree.py      grouped sidebar, homepage pins
   models.py             virtualized model, poster cache, delegates
   player_widget.py      libVLC surface, operations, the up-next card
   home_page.py          the homepage wall, rails across every kind
