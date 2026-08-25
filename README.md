@@ -426,6 +426,13 @@ guessing about where focus is. In fullscreen the status bar is hidden, so a
 keypress pops the floating control bar up instead — it shows the new position
 and volume, then fades out again.
 
+**The mouse wheel changes the volume too**, whenever it is over the video —
+windowed, fullscreen, or Picture-in-Picture — the same step as the volume
+slider itself and shown the same way. Unlike the arrow keys this needs no
+focus, just hover: the video is never reparented for fullscreen or PiP, so
+hovering it reaches the same handling everywhere. It stays out of the way
+everywhere else — scroll the catalog list or the homepage and only they move.
+
 **Adjustments and Effects** (the ⚙ button) is VLC's panel: a 10-band equaliser
 with all 18 of VLC's presets and a preamp, and video adjustment for contrast,
 brightness, saturation, gamma and hue. Settings persist and are re-applied to

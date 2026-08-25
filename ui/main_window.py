@@ -1857,6 +1857,8 @@ class MainWindow(QMainWindow):
         """
         if event.type() == QEvent.KeyPress and self._handle_player_key(event):
             return True
+        if event.type() == QEvent.Wheel and self._handle_player_wheel(event, obj):
+            return True
         return super().eventFilter(obj, event)
 
     @staticmethod
@@ -1885,6 +1887,34 @@ class MainWindow(QMainWindow):
         if focused is None:
             return False
         return focused is self.player.surface or self.player.isAncestorOf(focused)
+
+    def _handle_player_wheel(self, event, obj) -> bool:
+        """Scroll over the video to change the volume, VLC's own convention.
+
+        Gated on the surface itself rather than on focus, unlike the arrow
+        keys: a wheel event is delivered to whatever the pointer is over, and
+        hovering the video is the obvious way to reach for it - there is no
+        reason to click it first the way the keyboard does. Hovering the
+        surface already covers fullscreen and Picture-in-Picture, since it is
+        never reparented for either; it just grows to fill them.
+
+        Every event delivered here is claimed, whatever its direction,
+        including a stray horizontal one: the surface has nothing of its own
+        to do with a wheel event, and an unaccepted one is exactly the input
+        macOS reads as a swipe between full-screen Spaces (the same failure
+        already fixed for the scroll areas in BoundedScrollArea) - now doubly
+        likely here, since fullscreen video is the most natural place to keep
+        scrolling.
+        """
+        if obj is not self.player.surface or not self.player.available:
+            return False
+        delta = event.angleDelta().y()
+        if delta:
+            step = VOLUME_STEP if delta > 0 else -VOLUME_STEP
+            self._key_feedback(f"Volume {self.player.bar.nudge_volume(step)}%")
+            self.db.set_setting("volume", str(self.player.bar.volume.value()))
+        event.accept()
+        return True
 
     def _handle_player_key(self, event) -> bool:
         """Returns True when the key was consumed as a player command."""
