@@ -149,6 +149,18 @@ def main() -> int:
         return selftest()
 
     QGuiApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+    # Windows at a fractional scale (125%, 150%...) is where this actually
+    # matters: Qt's older default rounds the scale factor to the nearest
+    # whole number before computing window geometry, which then disagrees by
+    # a pixel or two with what the OS itself reports for the monitor - a
+    # fullscreen window sized from the rounded figure comes out a sliver
+    # smaller than the real screen, leaving a hairline gap the desktop shows
+    # through at the edges. PassThrough uses the exact factor Windows
+    # reports instead of rounding it, which is what removes the mismatch at
+    # its source. Harmless everywhere else: macOS reports only whole device
+    # pixel ratios, so there is nothing here to round in the first place.
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName("IPTV Player")
     app.setOrganizationName("IPTVPlayer")
