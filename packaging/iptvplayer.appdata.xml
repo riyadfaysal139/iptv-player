@@ -45,6 +45,16 @@
   </provides>
 
   <releases>
+    <release version="1.3.0" date="2026-08-25">
+      <description>
+        <p>A Netflix-style homepage mixing channels, films and shows in one
+        wall of rows, fully keyboard-navigable, arrangeable, and pageable as
+        you scroll. Shows get their own page with resumable episodes, a
+        seasons tab strip and the same keyboard navigation. A master search
+        across the whole catalog, an "up next" prompt between episodes, and
+        the mouse wheel now changes the volume over the video.</p>
+      </description>
+    </release>
     <release version="1.2.0" date="2026-08-23">
       <description>
         <p>Picture-in-Picture: shrink the window to a small player that stays
