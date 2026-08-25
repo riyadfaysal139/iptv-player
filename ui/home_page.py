@@ -527,6 +527,25 @@ class RailDelegate(PosterDelegate):
         painter.restore()
 
 
+class RailListView(QListView):
+    """A rail's poster strip. Never captures the vertical wheel.
+
+    The view has a real horizontal range (it is what scrolls the row sideways)
+    and no vertical one, and Qt's default QAbstractItemView.wheelEvent() maps
+    an unused vertical wheel onto whichever scrollbar the view does have
+    rather than leaving the event alone - measured directly: a vertical wheel
+    over a rail panned it sideways and left the page exactly where it was,
+    which is what "the wheel does nothing over a section" looks like from the
+    keyboard's other end. Ignoring the event here is what lets Qt's normal
+    "an ignored wheel event goes to the parent" rule carry it up to the wall's
+    own scroll area instead, matching the gaps between rails, which were never
+    affected because nothing there had a range to steal it into.
+    """
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 class HomeRail(QWidget):
     """One horizontal row of posters, scrolling sideways."""
 
@@ -578,7 +597,7 @@ class HomeRail(QWidget):
         box.addLayout(header)
 
         self.model = CatalogModel(self)
-        self.view = QListView()
+        self.view = RailListView()
         self.view.setObjectName("posterGrid")
         self.view.setModel(self.model)
         self.view.setViewMode(QListView.IconMode)

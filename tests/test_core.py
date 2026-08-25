@@ -1697,6 +1697,65 @@ class TestBoundedScrollArea(unittest.TestCase):
         self.assertEqual(self.area.verticalScrollBar().value(), 0)
 
 
+class TestRailListView(unittest.TestCase):
+    """A homepage rail must not steal a vertical wheel for itself.
+
+    Measured directly: QAbstractItemView's default wheelEvent() maps an
+    unused vertical wheel onto whichever scrollbar the view DOES have - a
+    rail only has a horizontal one, so scrolling down over a rail's posters
+    silently panned it sideways and left the wall exactly where it was. From
+    the wall's own scroll area's point of view that reads as "the wheel does
+    nothing over a section", which is exactly what was reported. Ignoring
+    the event unconditionally is what lets it reach the wall instead.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QStandardItem, QStandardItemModel, QWheelEvent
+
+        from ui.home_page import RailListView
+
+        self.Qt = Qt
+        self.QPoint, self.QPointF, self.QWheelEvent = QPoint, QPointF, QWheelEvent
+        self.view = RailListView()
+        self.view.setFlow(RailListView.LeftToRight)
+        self.view.setWrapping(False)
+        self.view.setFixedSize(200, 100)
+        # Enough rows to give a narrow, fixed-width view a real horizontal
+        # range - a rail's own defining trait, and what Qt's default handling
+        # remaps the vertical wheel onto.
+        model = QStandardItemModel()
+        for n in range(40):
+            model.appendRow(QStandardItem(f"item {n}"))
+        self.view.setModel(model)
+
+    def wheel(self, delta_y: int):
+        event = self.QWheelEvent(
+            self.QPointF(10, 10), self.QPointF(10, 10),
+            self.QPoint(0, 0), self.QPoint(0, delta_y),
+            self.Qt.NoButton, self.Qt.NoModifier, self.Qt.NoScrollPhase, False,
+        )
+        self.view.wheelEvent(event)
+        return event
+
+    def test_a_vertical_wheel_is_ignored_not_accepted(self):
+        self.assertFalse(self.wheel(-240).isAccepted())
+
+    def test_and_it_does_not_move_the_rail_sideways_either(self):
+        before = self.view.horizontalScrollBar().value()
+        self.wheel(-240)
+        self.assertEqual(self.view.horizontalScrollBar().value(), before)
+
+    def test_scrolling_up_is_ignored_too(self):
+        self.assertFalse(self.wheel(240).isAccepted())
+
+
 class TestHomeOrder(unittest.TestCase):
     """Moving a homepage row up or down, and remembering where it went."""
 
