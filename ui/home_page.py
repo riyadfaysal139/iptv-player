@@ -25,6 +25,7 @@ from ui.gridnav import move_cursor
 from ui.models import (
     POSTER_H, POSTER_W, ROLE_ITEM, ROLE_KIND, CatalogModel, PosterDelegate,
 )
+from ui.scrollarea import BoundedScrollArea
 
 ROW_CAP = 20            # posters per rail
 GENRE_ROWS = 5          # how many of the provider's genres get a rail
@@ -695,7 +696,7 @@ class HomePage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        scroll = QScrollArea()
+        scroll = BoundedScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setObjectName("homeScroll")

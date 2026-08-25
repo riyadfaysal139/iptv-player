@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 
 from ui import icons
 from ui.gridnav import move_cursor, rows_from_geometry
+from ui.scrollarea import BoundedScrollArea
 
 POSTER_WIDTH = 260
 CARD_WIDTH = 268
@@ -372,7 +373,7 @@ class SeriesPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        scroll = QScrollArea()
+        scroll = BoundedScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setObjectName("seriesScroll")

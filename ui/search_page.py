@@ -15,7 +15,7 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QLineEdit, QListView, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget,
 )
 
 from core.db import fold
@@ -24,6 +24,7 @@ from ui.models import (
     POSTER_H, POSTER_W, ROW_HEIGHT, ROLE_ITEM, CatalogModel, ChannelDelegate,
     PosterDelegate,
 )
+from ui.scrollarea import BoundedScrollArea
 
 # Different caps per kind because a 44px channel row and a 238px poster cell
 # fill very different amounts of a section.
@@ -185,7 +186,7 @@ class SearchPage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        scroll = QScrollArea()
+        scroll = BoundedScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setObjectName("searchScroll")
@@ -193,6 +194,7 @@ class SearchPage(QWidget):
         body.setObjectName("searchBody")
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
+        self.scroll = scroll
 
         root = QVBoxLayout(body)
         root.setContentsMargins(28, 22, 28, 28)

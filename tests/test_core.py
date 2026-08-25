@@ -1639,6 +1639,64 @@ class TestHomeCursor(unittest.TestCase):
             self.assertIsNone(self.move([0, 0], None, d_rail, d_column))
 
 
+class TestBoundedScrollArea(unittest.TestCase):
+    """Scrolling to the end must not hand macOS an unclaimed wheel event.
+
+    An ignored wheel event at a QScrollArea's boundary is what AppKit's own
+    "swipe between full-screen applications" gesture watches for, which is
+    what turned "scroll to the bottom of the homepage" into "the desktop
+    switched to another Space". There is no hook to prove the OS gesture
+    itself did not fire - only that this widget never leaves an event for it
+    to notice.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QWheelEvent
+        from PySide6.QtWidgets import QLabel
+
+        from ui.scrollarea import BoundedScrollArea
+
+        self.Qt = Qt
+        self.QPoint, self.QPointF, self.QWheelEvent = QPoint, QPointF, QWheelEvent
+        self.area = BoundedScrollArea()
+        self.area.setFixedHeight(200)
+        self.area.setWidgetResizable(True)
+        body = QLabel()
+        body.setFixedSize(200, 2000)      # tall enough that it can actually scroll
+        self.area.setWidget(body)
+
+    def wheel(self, delta_y: int):
+        event = self.QWheelEvent(
+            self.QPointF(10, 10), self.QPointF(10, 10),
+            self.QPoint(0, 0), self.QPoint(0, delta_y),
+            self.Qt.NoButton, self.Qt.NoModifier, self.Qt.NoScrollPhase, False,
+        )
+        self.area.wheelEvent(event)
+        return event
+
+    def test_a_normal_scroll_is_accepted(self):
+        self.assertTrue(self.wheel(-100).isAccepted())
+
+    def test_scrolling_past_the_bottom_is_still_accepted(self):
+        bar = self.area.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        event = self.wheel(-500)          # further down, with nothing left
+        self.assertTrue(event.isAccepted())
+        self.assertEqual(bar.value(), bar.maximum())    # clamps, does not raise
+
+    def test_scrolling_past_the_top_is_still_accepted(self):
+        event = self.wheel(500)           # up, already at the top
+        self.assertTrue(event.isAccepted())
+        self.assertEqual(self.area.verticalScrollBar().value(), 0)
+
+
 class TestHomeOrder(unittest.TestCase):
     """Moving a homepage row up or down, and remembering where it went."""
 
