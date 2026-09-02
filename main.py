@@ -47,6 +47,20 @@ def selftest() -> int:
         except Exception:
             pass
 
+    # Attaching is best-effort and has been observed to fail outright under
+    # PowerShell 7's ConPTY (as opposed to a classic console, where it works)
+    # - and a frozen windowed build otherwise has no stdout/stderr at all
+    # (they are None, not merely redirected). Every print() below would crash
+    # the whole process on the first line with no visible error, since stderr
+    # is None too. A do-nothing stream keeps print() harmless either way; the
+    # disk report a few lines down is the real, always-reliable output.
+    import io
+
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
+
     try:
         return _run_selftest(importlib)
     finally:
