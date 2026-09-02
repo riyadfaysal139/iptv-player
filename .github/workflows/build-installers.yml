@@ -83,7 +83,22 @@ jobs:
       - name: Verify the frozen executable
         run: |
           .\dist\IPTVPlayer\IPTVPlayer.exe --selftest
-          if ($LASTEXITCODE -ne 0) { throw "self-test failed" }
+          $exitCode = $LASTEXITCODE
+          # A windowed (console=False) build has no real stdout to capture here
+          # even when the AttachConsole trick in main.py's selftest() works -
+          # CI redirects the step's own output through a pipe, not a console
+          # screen buffer, so text written via CONOUT$ never reaches this log.
+          # selftest() already writes the same report to disk for exactly this
+          # case; print it so a CI failure is actually diagnosable.
+          $report = Join-Path $env:APPDATA "IPTVPlayer\selftest.txt"
+          if (Test-Path $report) {
+            Write-Host "----- selftest.txt -----"
+            Get-Content $report
+            Write-Host "-------------------------"
+          } else {
+            Write-Host "no selftest.txt report was written to $report"
+          }
+          if ($exitCode -ne 0) { throw "self-test failed (exit $exitCode)" }
 
       - name: Build installer
         # The runner image ships Inno Setup, but do not depend on that: a runner
