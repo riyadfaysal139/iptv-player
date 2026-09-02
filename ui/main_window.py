@@ -8,6 +8,7 @@ player slides in beside it on play, then folds away again when playback stops.
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -1551,9 +1552,22 @@ class MainWindow(QMainWindow):
         # _hide_chrome hides wholesale — leaving fullscreen puts you back on
         # whichever of them you were reading.
         self._fs_state = self._save_chrome()
+        self._fs_state["flags"] = self.windowFlags()
         self._right_pane.show()     # the video lives in it; saved state puts it back
         self._hide_chrome()
+        # Stay-on-top is what actually keeps the taskbar underneath: the shell
+        # keeps it in its own topmost band, so a window merely *sized* to the
+        # monitor still gets the taskbar drawn over its bottom edge. Set the
+        # same way PiP does, including the re-attach guard — Qt restacks the
+        # native window in place rather than recreating it, but if a platform
+        # does recreate it, libVLC's drawable has to be re-bound.
+        handle = int(self.player.surface.winId())
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.showFullScreen()
+        if int(self.player.surface.winId()) != handle:
+            self.player.reattach_surface()
+        self._set_native_chrome(True)
+        self._fill_screen()
         self._float_bar()
         # The overlay is a separate top-level and takes activation with it, so
         # claim it back and put focus on the video — otherwise nothing holds
@@ -1565,6 +1579,122 @@ class MainWindow(QMainWindow):
         self._fs_idle_ms = 0
         self._fs_last_cursor = QCursor.pos()
         self._fs_timer.start()
+
+    def _fill_screen(self):
+        """Assert the window geometry against the real monitor rectangle.
+
+        showFullScreen() alone can still land the window short of the actual
+        monitor bounds on one or two edges — even with the PassThrough DPI
+        rounding policy set in main.py. Qt's geometry API works in device-
+        independent pixels, and round-tripping a fractional scale factor
+        (125%, 150%...) through that layer doesn't always land back on a
+        whole physical pixel, so the window ends up a hair short of the
+        monitor on the edges where the rounding goes the wrong way. Windows
+        then doesn't treat the window as truly covering the screen and keeps
+        the taskbar (or a sliver of desktop) visible through the gap.
+        Reasserting the geometry closes it; doing so again after the event
+        loop turns (QTimer.singleShot(0)) covers Qt re-issuing its own
+        resize once the fullscreen transition and per-monitor DPI settle.
+        """
+        self._snap_to_monitor()
+        QTimer.singleShot(0, self._snap_to_monitor_if_fullscreen)
+
+    def _snap_to_monitor_if_fullscreen(self):
+        if self._fs_state:
+            self._snap_to_monitor()
+
+    def _set_native_chrome(self, fullscreen: bool):
+        """Turn off Windows 11's rounded corners and DWM border for fullscreen.
+
+        DWM draws both *outside* the window's own content, so a window that is
+        exactly monitor-sized still gets the desktop showing through its four
+        rounded corners and a light hairline along its edges. That is the white
+        line at the bottom of the screen, and no geometry or z-order fix can
+        remove it — the window is already the right size and already on top;
+        the compositor is simply painting over it. Media players (VLC included)
+        switch both off for the duration of fullscreen and restore them after.
+
+        No-ops on Windows 10 and earlier, where DWM rejects both attributes.
+        """
+        if not sys.platform.startswith("win"):
+            return
+        import ctypes
+
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWA_BORDER_COLOR = 34
+        DWMWCP_DEFAULT, DWMWCP_DONOTROUND = 0, 1
+        DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE = 0xFFFFFFFF, 0xFFFFFFFE
+
+        settings = (
+            (DWMWA_WINDOW_CORNER_PREFERENCE,
+             DWMWCP_DONOTROUND if fullscreen else DWMWCP_DEFAULT),
+            (DWMWA_BORDER_COLOR,
+             DWMWA_COLOR_NONE if fullscreen else DWMWA_COLOR_DEFAULT),
+        )
+        try:
+            hwnd = int(self.winId())
+            for attribute, value in settings:
+                held = ctypes.c_uint(value)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(held), ctypes.sizeof(held))
+        except OSError:
+            pass
+
+    def _snap_to_monitor(self):
+        # The Win32 path commands the native HWND straight to the monitor's
+        # physical pixel rectangle, sidestepping Qt's DIP rounding entirely;
+        # it's tried first because that rounding is the actual source of the
+        # gap. Anything else falls back to the ordinary Qt-level call.
+        if sys.platform.startswith("win") and self._snap_to_monitor_win32():
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            self.setGeometry(screen.geometry())
+
+    def _snap_to_monitor_win32(self) -> bool:
+        """Resize this window's HWND to exactly fill its monitor via Win32.
+
+        Geometry only — z-order is left alone (SWP_NOZORDER) because the
+        stay-on-top flag set in `enter_fullscreen()` owns that. Asserting
+        HWND_TOPMOST here as well does not survive: the `raise_()` at the end
+        of `enter_fullscreen()` re-stacks with HWND_TOP, which clears topmost
+        again, so the two mechanisms fight and the taskbar wins.
+
+        Returns False on any lookup failure so the caller falls back to the
+        Qt-level geometry call — a missing monitor handle should degrade the
+        fullscreen transition, not crash it.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                        ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+        MONITOR_DEFAULTTONEAREST = 2
+        SWP_NOZORDER = 0x0004
+        SWP_NOACTIVATE = 0x0010
+        SWP_FRAMECHANGED = 0x0020
+
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            hmonitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                return False
+            rect = info.rcMonitor
+            return bool(user32.SetWindowPos(
+                hwnd, 0, rect.left, rect.top,
+                rect.right - rect.left, rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED))
+        except OSError:
+            return False
 
     def _float_bar(self, area=None, inset: int = 80, gap: int = 28,
                    max_width: int = 1100):
@@ -1635,6 +1765,10 @@ class MainWindow(QMainWindow):
         self.player.set_chrome_visible(True)
         self._restore_chrome(state)
 
+        # Drop stay-on-top again, or the window stays pinned over other apps.
+        self._set_native_chrome(False)
+        self.setWindowFlags(state["flags"])
+        self.show()
         self.showNormal()
         self.restoreGeometry(state["geometry"])
         if state["maximized"]:
