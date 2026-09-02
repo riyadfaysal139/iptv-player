@@ -18,12 +18,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', 'IPTV Player'),
           StringStruct('FileDescription', 'IPTV Player'),
-          StringStruct('FileVersion', '1.3.0.0'),
+          StringStruct('FileVersion', '1.3.1.0'),
           StringStruct('InternalName', 'IPTVPlayer'),
           StringStruct('LegalCopyright', 'Playback powered by VLC (VideoLAN).'),
           StringStruct('OriginalFilename', 'IPTVPlayer.exe'),
           StringStruct('ProductName', 'IPTV Player'),
-          StringStruct('ProductVersion', '1.3.0.0'),
+          StringStruct('ProductVersion', '1.3.1.0'),
         ],
       )
     ]),

@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 ARCH="$(uname -m)"
 APPDIR="build/AppDir"
 APPIMAGE="dist/IPTV_Player-${VERSION}-${ARCH}.AppImage"
