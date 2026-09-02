@@ -34,6 +34,8 @@ def selftest() -> int:
     # A windowed Windows build has no stdout, so print() would vanish when the
     # self-test is run from cmd. Attach to the parent console so the report is
     # actually readable; the exit code alone is not enough to debug a build.
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    console_attached = False
     if sys.platform.startswith("win"):
         try:
             import ctypes
@@ -41,9 +43,31 @@ def selftest() -> int:
             if ctypes.windll.kernel32.AttachConsole(-1):
                 sys.stdout = open("CONOUT$", "w", buffering=1)
                 sys.stderr = open("CONOUT$", "w", buffering=1)
+                console_attached = True
         except Exception:
             pass
 
+    try:
+        return _run_selftest(importlib)
+    finally:
+        # Interpreter shutdown flushes and closes sys.stdout/sys.stderr. A
+        # windowed build has no message pump, and closing a CONOUT$ handle in
+        # that state has been observed (specifically under PowerShell 7's
+        # ConPTY, not a classic console) to turn a failure there into a
+        # nonzero process exit code - even on a run that computed and printed
+        # SELFTEST: PASS. Restoring the original streams (None, for a frozen
+        # windowed build) means shutdown has nothing of ours left to touch.
+        if console_attached:
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                    stream.close()
+                except Exception:
+                    pass
+            sys.stdout, sys.stderr = original_stdout, original_stderr
+
+
+def _run_selftest(importlib) -> int:
     modules = [
         "core.api", "core.classify", "core.db", "core.downloads", "core.m3u",
         "core.playlists", "core.subtitles", "core.sync", "core.vlc_setup",
