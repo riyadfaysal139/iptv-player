@@ -15,17 +15,9 @@ permissions:
   contents: write
 
 jobs:
-  macos:
-    name: macOS (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14      # Apple Silicon
-            arch: arm64
-          - runner: macos-13      # Intel
-            arch: x86_64
+  macos_arm64:
+    name: macOS (arm64)
+    runs-on: macos-14      # Apple Silicon
     steps:
       - uses: actions/checkout@v4
 
@@ -53,7 +45,45 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: IPTV-Player-macOS-${{ matrix.arch }}
+          name: IPTV-Player-macOS-arm64
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  macos_intel:
+    name: macOS (x86_64)
+    # GitHub's Intel runners are the scarcest in the fleet: this job has sat
+    # queued for a quarter of an hour while the other three finished in two
+    # minutes flat. The release therefore does not wait for it — see
+    # attach_intel below, which adds the DMG whenever it eventually lands.
+    runs-on: macos-13      # Intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller Pillow
+
+      - name: Build DMG
+        env:
+          PYTHON: python
+        run: |
+          chmod +x packaging/build_macos.sh
+          ./packaging/build_macos.sh
+
+      - name: Verify the frozen app
+        # VLC is absent on the runner; the self-test reports that without
+        # failing, since VLC is the end user's to install.
+        run: ./"dist/IPTV Player.app/Contents/MacOS/IPTVPlayer" --selftest
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Player-macOS-x86_64
           path: dist/*.dmg
           if-no-files-found: error
 
@@ -192,9 +222,26 @@ jobs:
             dist/*.tar.gz
           if-no-files-found: error
 
+  attach_intel:
+    name: Add the Intel DMG when it lands
+    needs: [macos_intel, release]
+    # The release exists by now; this only ever adds a file to it. `always()`
+    # so that a failed or cancelled Intel build cannot fail the run that
+    # already published everything else.
+    if: always() && needs.macos_intel.result == 'success' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: IPTV-Player-macOS-x86_64
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.dmg
+
   release:
     name: Attach to release
-    needs: [macos, windows, linux]
+    needs: [macos_arm64, windows, linux]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -215,7 +262,7 @@ jobs:
             |---|---|
             | Windows 64-bit | `IPTV-Player-*-Windows-x64-Setup.exe` |
             | macOS (Apple Silicon) | `IPTV-Player-*-macOS-arm64.dmg` |
-            | macOS (Intel) | `IPTV-Player-*-macOS-x86_64.dmg` |
+            | macOS (Intel) | `IPTV-Player-*-macOS-x86_64.dmg` &nbsp;(added when its build finishes) |
             | Linux x86_64 | `IPTV_Player-*-x86_64.AppImage` |
             | Linux x86_64 (fallback) | `IPTV-Player-*-linux-x86_64.tar.gz` |
 
