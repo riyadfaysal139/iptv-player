@@ -135,6 +135,23 @@ CREATE TABLE IF NOT EXISTS series_info (
     PRIMARY KEY (playlist_id, series_id)
 );
 
+-- get_vod_info's "info" object, per film, fetched when the homepage's hero
+-- lands on one. Same idea as series_info: on demand, never in the bulk sync.
+CREATE TABLE IF NOT EXISTS movie_info (
+    playlist_id  INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    stream_id    TEXT NOT NULL,
+    backdrop     TEXT,
+    plot         TEXT,
+    cast_list    TEXT,
+    director     TEXT,
+    genre        TEXT,
+    release_date TEXT,
+    rating       REAL,
+    duration     TEXT,
+    fetched_at   INTEGER,
+    PRIMARY KEY (playlist_id, stream_id)
+);
+
 CREATE TABLE IF NOT EXISTS favourites (
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
     kind        TEXT NOT NULL,
@@ -208,6 +225,15 @@ CREATE TABLE IF NOT EXISTS downloads (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Credentials, used only when the OS keychain is turned off (Settings ▸ Store
+-- passwords in the system keychain). Values are obfuscated, not encrypted -
+-- the file already sits in the user's private config dir, same as the keychain
+-- fallback stores that ship with `keyrings.alt`.
+CREATE TABLE IF NOT EXISTS secrets (
     key   TEXT PRIMARY KEY,
     value TEXT
 );

@@ -1,8 +1,9 @@
 """Playlist (source) management: add, edit, delete, switch.
 
 Nothing is hardcoded — the first playlist is created by the user through the
-add wizard. Passwords go to the OS keychain keyed by playlist id, never into
-the SQLite file.
+add wizard. Passwords go to the OS keychain keyed by playlist id; a setting
+(`use_local_store`) moves them into an obfuscated table in the SQLite file
+instead, for setups where the keychain's unlock prompt is unwanted.
 """
 
 from __future__ import annotations
@@ -22,6 +23,89 @@ try:
 except Exception:  # pragma: no cover - keyring is optional at runtime
     keyring = None
     _KEYRING_OK = False
+
+# When set to a Database, credentials live in that file instead of the OS
+# keychain - for setups where the keychain's unlock prompt is unwanted or
+# unusable (an unattended box, a kiosk). `use_local_store()` flips it.
+_local_db = None
+
+# Reads are cached for the life of the process so an unlocked keychain is asked
+# once per key, not on every stream start.
+_cache: dict[str, str] = {}
+
+_OBFUSCATE_KEY = b"iptv-player/secret-at-rest/v1"
+
+
+def use_local_store(db) -> None:
+    """Route credentials to `db` (a Database) rather than the OS keychain, or
+    back to the keychain when `db` is None. Clears the read cache."""
+    global _local_db
+    _local_db = db
+    _cache.clear()
+
+
+def local_store_active() -> bool:
+    return _local_db is not None
+
+
+def _xor(raw: bytes) -> bytes:
+    key = _OBFUSCATE_KEY
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+
+
+def _scramble(text: str) -> str:
+    import base64
+
+    return base64.b64encode(_xor(text.encode("utf-8"))).decode("ascii")
+
+
+def _unscramble(blob: str) -> str:
+    import base64
+
+    try:
+        return _xor(base64.b64decode(blob.encode("ascii"))).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _store_set(key: str, value: str) -> None:
+    _cache.pop(key, None)
+    if _local_db is not None:
+        if value:
+            _local_db.execute(
+                "INSERT INTO secrets(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, _scramble(value)),
+            )
+        else:
+            _local_db.execute("DELETE FROM secrets WHERE key=?", (key,))
+        return
+    if not _KEYRING_OK:
+        return
+    try:
+        if value:
+            keyring.set_password(KEYRING_SERVICE, key, value)
+        else:
+            keyring.delete_password(KEYRING_SERVICE, key)
+    except Exception:
+        # A locked or unavailable keychain must not break the app.
+        pass
+
+
+def _store_get(key: str) -> str:
+    if key in _cache:
+        return _cache[key]
+    value = ""
+    if _local_db is not None:
+        row = _local_db.one("SELECT value FROM secrets WHERE key=?", (key,))
+        value = _unscramble(row["value"]) if row and row["value"] else ""
+    elif _KEYRING_OK:
+        try:
+            value = keyring.get_password(KEYRING_SERVICE, key) or ""
+        except Exception:
+            value = ""
+    _cache[key] = value
+    return value
 
 
 TYPE_XTREAM = "xtream"
@@ -73,63 +157,58 @@ def _key(playlist_id: int, namespace: str = "") -> str:
     return f"{namespace}-playlist-{playlist_id}" if namespace else f"playlist-{playlist_id}"
 
 
+def _secret_key(name: str, namespace: str = "") -> str:
+    return f"{namespace}-{name}" if namespace else name
+
+
 def set_password(playlist_id: int, password: str, namespace: str = ""):
-    if not _KEYRING_OK:
-        return
-    try:
-        if password:
-            keyring.set_password(KEYRING_SERVICE, _key(playlist_id, namespace), password)
-        else:
-            keyring.delete_password(KEYRING_SERVICE, _key(playlist_id, namespace))
-    except Exception:
-        # A locked or unavailable keychain must not break the app.
-        pass
+    _store_set(_key(playlist_id, namespace), password)
 
 
 def get_password(playlist_id: int, namespace: str = "") -> str:
-    if not _KEYRING_OK:
-        return ""
-    try:
-        return keyring.get_password(KEYRING_SERVICE, _key(playlist_id, namespace)) or ""
-    except Exception:
-        return ""
+    return _store_get(_key(playlist_id, namespace))
 
 
 def clear_password(playlist_id: int, namespace: str = ""):
-    if not _KEYRING_OK:
-        return
-    try:
-        keyring.delete_password(KEYRING_SERVICE, _key(playlist_id, namespace))
-    except Exception:
-        pass
+    _store_set(_key(playlist_id, namespace), "")
 
 
 def set_secret(name: str, value: str, namespace: str = ""):
     """Store a non-playlist credential — currently the OpenSubtitles login.
 
-    Same keychain, same namespacing rule: a second profile or a test fixture
-    must not be able to overwrite the real one.
+    Same store, same namespacing rule: a second profile or a test fixture must
+    not be able to overwrite the real one.
     """
-    if not _KEYRING_OK:
-        return
-    key = f"{namespace}-{name}" if namespace else name
-    try:
-        if value:
-            keyring.set_password(KEYRING_SERVICE, key, value)
-        else:
-            keyring.delete_password(KEYRING_SERVICE, key)
-    except Exception:
-        pass
+    _store_set(_secret_key(name, namespace), value)
 
 
 def get_secret(name: str, namespace: str = "") -> str:
-    if not _KEYRING_OK:
-        return ""
-    key = f"{namespace}-{name}" if namespace else name
-    try:
-        return keyring.get_password(KEYRING_SERVICE, key) or ""
-    except Exception:
-        return ""
+    return _store_get(_secret_key(name, namespace))
+
+
+def switch_store(db, to_local: bool, playlist_ids=(), secret_names=()) -> None:
+    """Move known credentials between the keychain and the local DB, then make
+    the target active.
+
+    Best-effort: anything that cannot be read right now (a locked keychain that
+    the user dismissed) is simply left behind for them to re-enter. `db` is a
+    Database; `playlist_ids` and `secret_names` say what to carry over.
+    """
+    namespace = db.instance_id
+    carried: dict[str, str] = {}
+    for pid in playlist_ids:
+        value = get_password(pid, namespace)
+        if value:
+            carried[_key(pid, namespace)] = value
+    for name in secret_names:
+        value = get_secret(name, namespace)
+        if value:
+            carried[_secret_key(name, namespace)] = value
+
+    use_local_store(db if to_local else None)
+
+    for key, value in carried.items():
+        _store_set(key, value)
 
 
 # --------------------------------------------------------------------------

@@ -155,6 +155,10 @@ class XtreamClient:
         data = self._call("get_series_info", series_id=series_id)
         return data if isinstance(data, dict) else {}
 
+    def vod_info(self, vod_id) -> dict:
+        data = self._call("get_vod_info", vod_id=vod_id)
+        return data if isinstance(data, dict) else {}
+
     def short_epg(self, stream_id, limit: int = 6) -> list:
         data = self._call("get_short_epg", stream_id=stream_id, limit=limit)
         listings = (data or {}).get("epg_listings") or []

@@ -507,6 +507,36 @@ def save_series_info(db: Database, playlist_id: int, series_id, info, now=None):
     )
 
 
+def fetch_movie_info(db: Database, playlist: Playlist, stream_id) -> dict:
+    """One film's details (plot, backdrop, genre...), saved for next time."""
+    payload = playlist.client().vod_info(stream_id)
+    info = payload.get("info") if isinstance(payload, dict) else None
+    save_movie_info(db, playlist.id, stream_id, info)
+    return info or {}
+
+
+def save_movie_info(db: Database, playlist_id: int, stream_id, info, now=None):
+    if not isinstance(info, dict):
+        info = {}
+    db.execute(
+        "INSERT OR REPLACE INTO movie_info(playlist_id, stream_id, backdrop, plot,"
+        " cast_list, director, genre, release_date, rating, duration, fetched_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            playlist_id, str(stream_id),
+            first_backdrop(info.get("backdrop_path")),
+            (info.get("plot") or info.get("description") or "").strip(),
+            (info.get("cast") or info.get("actors") or "").strip(),
+            (info.get("director") or "").strip(),
+            (info.get("genre") or "").strip(),
+            (info.get("releasedate") or info.get("release_date") or "").strip(),
+            _as_float(info.get("rating")),
+            (info.get("duration") or "").strip(),
+            now if now is not None else int(time.time()),
+        ),
+    )
+
+
 def _as_float(value):
     try:
         return float(value)
