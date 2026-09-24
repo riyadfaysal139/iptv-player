@@ -51,11 +51,13 @@ jobs:
 
   macos_intel:
     name: macOS (x86_64)
-    # GitHub's Intel runners are the scarcest in the fleet: this job has sat
-    # queued for a quarter of an hour while the other three finished in two
-    # minutes flat. The release therefore does not wait for it — see
-    # attach_intel below, which adds the DMG whenever it eventually lands.
-    runs-on: macos-13      # Intel
+    # macos-13 was retired on 2025-12-04: the label still parses, so the job
+    # is accepted and then queues for a runner that no longer exists — three
+    # releases in a row sat waiting on it with no error to show for it.
+    # macos-15-intel is the replacement, and the last Intel image Actions will
+    # have: x86_64 support ends in August 2027, after which this job should be
+    # dropped and Intel Macs served by the arm64 build under Rosetta.
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
