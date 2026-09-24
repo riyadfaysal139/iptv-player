@@ -18,6 +18,7 @@ operations the bar drives.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,16 @@ SWITCH_DEBOUNCE_MS = 300
 # A second request arriving faster than this looks like key-repeat rather than
 # a deliberate choice, so it gets debounced; a lone click starts at once.
 REPEAT_WINDOW_MS = 400
+# An "end" this far from the known duration is a dropped stream, not the
+# credits: the CDN closed the socket mid-episode, and libVLC reports that with
+# the same EndReached it uses for a real finish.
+EARLY_END_SLACK_S = 30
+EARLY_END_RETRIES = 4
+# Ticks (½ s each) over which the volume is re-asserted after a start: the
+# audio output is created when the first samples arrive, and PulseAudio's
+# stream-restore then hands it whatever level it remembers for "VLC".
+VOLUME_SYNC_TICKS = 10
+SUBTITLE_SYNC_TICKS = 40
 
 # Neutral values for VLC's video adjustments; all-neutral means the filter is
 # left switched off rather than inserted into the chain for nothing.
@@ -52,6 +63,150 @@ SEEK_TAIL_MS = 1000
 UP_NEXT_STILL = (280, 158)
 
 
+def _using_pulse() -> bool:
+    """True when a PulseAudio / PipeWire socket is there to play through."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if os.environ.get("PULSE_SERVER"):
+        return True
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not runtime:
+        return False
+    return (Path(runtime, "pulse", "native").exists()
+            or Path(runtime, "pipewire-0").exists())
+
+
+def _linux_audio_args() -> list[str]:
+    """Route audio through the sound server so it follows the system default.
+
+    libVLC's default output picker can land on the ALSA plugin, which opens one
+    HDMI/analog device directly and exclusively: it does not follow the desktop
+    default, and it fights whatever suspended the device (on this projector the
+    HDMI sink drops the start of a stream, or comes up silent, every time it has
+    to wake). Pinning the PulseAudio output - which is really PipeWire here -
+    makes the app behave like a browser: one stream on the default sink, moved
+    automatically when the default changes. Only forced when a PulseAudio or
+    PipeWire socket is actually present, so a pure-ALSA box is left alone.
+    """
+    return ["--aout=pulse"] if _using_pulse() else []
+
+
+# What an English subtitle track gets called, across providers and muxers.
+ENGLISH_TOKENS = frozenset({"english", "eng", "en"})
+
+
+def _tokens(name: str) -> list[str]:
+    import re
+
+    return re.findall(r"[a-z0-9]+", (name or "").lower())
+
+
+def match_track(want: str, tracks):
+    """The id of the track named like `want`, or None.
+
+    Exact first, then a loose match: providers label the same language
+    "English", "eng", "English [SDH]" from one file to the next.
+    """
+    want_l = (want or "").strip().lower()
+    if not want_l:
+        return None
+    for tid, name in tracks:
+        if name.strip().lower() == want_l:
+            return tid
+    for tid, name in tracks:
+        low = name.strip().lower()
+        if low and (want_l in low or low in want_l):
+            return tid
+    return None
+
+
+def english_track(tracks):
+    """The id of the first track labelled as English, or None.
+
+    Whole-word: "en" must not light up on "French", and "Track 1 - [eng]"
+    still counts. A plain "English" beats "English [Forced]"/"SDH" variants
+    when both exist, since the plain one is what most people want by default.
+    """
+    plain = None
+    any_english = None
+    for tid, name in tracks:
+        words = _tokens(name)
+        if not (set(words) & ENGLISH_TOKENS):
+            continue
+        if any_english is None:
+            any_english = tid
+        if plain is None and not (set(words) & {"forced", "sdh", "cc", "commentary"}):
+            plain = tid
+    return plain if plain is not None else any_english
+
+
+class _AudioKeepAlive:
+    """Hold the audio device open with an inaudible stream, VLC's absence of.
+
+    On HDMI / S-PDIF the codec parks when nothing is playing, and every start,
+    stop and pause then costs an audible pop or the first fraction of a second
+    of sound while the link re-locks. A second libVLC that loops pure silence
+    keeps the device permanently awake for as long as the app is open, so the
+    real stream never pays that cost - pausing included. Best-effort: any
+    failure here must never take playback down with it, so everything is
+    guarded and a broken keep-alive just does nothing.
+    """
+
+    def __init__(self):
+        self._instance = None
+        self._player = None
+        self._path = None
+
+    def start(self):
+        if self._player is not None or not _using_pulse():
+            return
+        try:
+            import vlc
+
+            self._path = self._silence_file()
+            self._instance = vlc.Instance("--quiet", "--no-video", "--aout=pulse")
+            self._player = self._instance.media_player_new()
+            media = self._instance.media_new(self._path)
+            media.add_option("input-repeat=65535")   # ~18 h of a 1 s clip; a session
+            self._player.set_media(media)
+            media.release()
+            # Not volume 0: PulseAudio remembers a level per application, and
+            # this instance is "VLC" just like the real one - a muted keep-alive
+            # was being restored onto the next stream, which then came up silent
+            # until the wheel touched the slider. The file is silence anyway.
+            self._player.play()
+        except Exception:
+            self.stop()
+
+    def stop(self):
+        for obj, release in ((self._player, "stop"), (self._instance, None)):
+            if obj is None:
+                continue
+            try:
+                if release:
+                    getattr(obj, release)()
+                obj.release()
+            except Exception:
+                pass
+        self._player = self._instance = None
+
+    @staticmethod
+    def _silence_file() -> str:
+        """A one-second stereo 48 kHz WAV of zeros, written once to a temp path."""
+        import struct
+        import tempfile
+        import wave
+
+        path = Path(tempfile.gettempdir()) / "iptvplayer-keepalive.wav"
+        if not path.exists():
+            with wave.open(str(path), "wb") as handle:
+                handle.setnchannels(2)
+                handle.setsampwidth(2)
+                handle.setframerate(48000)
+                handle.writeframes(struct.pack("<%dh" % (48000 * 2), *([0] * 48000 * 2)))
+        return str(path)
+
+
 def clamp_seek(position_ms: int, delta_s: int, duration_ms: int) -> int:
     """Where a relative jump should land, kept inside the media."""
     target = int(position_ms) + int(delta_s) * 1000
@@ -63,7 +218,9 @@ def clamp_seek(position_ms: int, delta_s: int, duration_ms: int) -> int:
 class VideoSurface(QFrame):
     """Native window libVLC renders into. Must stay opaque and un-styled."""
 
-    doubleClicked = Signal()
+    clicked = Signal(float)            # a single left click, sent at once; x 0..1
+    doubleClicked = Signal(float)      # x as a fraction of the width, 0..1
+    wheelScrolled = Signal(int, int)   # angleDelta().y(), int(modifiers)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,9 +246,33 @@ class VideoSurface(QFrame):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#000000"))
 
+    def mousePressEvent(self, event):
+        # Reported immediately rather than after the double-click interval: a
+        # pause that lands 400 ms late feels broken. A double-click therefore
+        # always arrives after one click has already been acted on, and the
+        # receiver undoes that first (see PlayerWidget._surface_double_clicked).
+        if event.button() == Qt.LeftButton:
+            width = max(1, self.width())
+            self.clicked.emit(event.position().x() / width)
+        super().mousePressEvent(event)
+
     def mouseDoubleClickEvent(self, event):
-        self.doubleClicked.emit()
+        if event.button() == Qt.LeftButton:
+            width = max(1, self.width())
+            self.doubleClicked.emit(event.position().x() / width)
         super().mouseDoubleClickEvent(event)
+
+    def wheelEvent(self, event):
+        # VLC changes the volume on a wheel over the video (Shift to seek). The
+        # app-level event filter in MainWindow also covers this, for the wheel
+        # events that libVLC's embedded child window forwards to the top-level
+        # rather than to this widget; whichever sees the event first handles it.
+        delta = event.angleDelta().y()
+        if delta:
+            self.wheelScrolled.emit(delta, int(event.modifiers().value))
+            event.accept()
+            return
+        super().wheelEvent(event)
 
 
 class UpNextPanel(QFrame):
@@ -196,9 +377,11 @@ class PlayerWidget(QWidget):
     playbackStarted = Signal()
     playbackStopped = Signal()
     fullscreenToggled = Signal()
-    videoDoubleClicked = Signal()
+    videoClicked = Signal(float)         # x fraction across the surface
+    videoDoubleClicked = Signal(float)
     upNextRequested = Signal()      # play what the card is offering
     upNextDismissed = Signal()      # the end-of-show card's way out
+    subtitlePreferenceChanged = Signal(object)   # track name, "" for off
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -213,6 +396,13 @@ class PlayerWidget(QWidget):
         self._resume_to = 0
         self._last_request_ms = 0.0
         self._muted = False
+        self._volume_sync = 0
+        self._last_position = 0
+        self._last_duration = 0
+        self._drop_retries = 0
+        self._drop_at = -1
+        self._preferred_subtitle = None   # None: English by default; "": off; else a track name
+        self._subtitle_sync = 0
         self._rate = 1.0
         self._aspect = ""
         self._crop = ""
@@ -222,6 +412,10 @@ class PlayerWidget(QWidget):
         self._equalizer_state = None
         self._adjust = dict(ADJUST_NEUTRAL)
         self.snapshot_dir = None        # set by MainWindow; falls back to app_dir
+        # Called just before libVLC is told to stop: the window uses it to cut
+        # the play-through cache's connection first, so stop() cannot wait on
+        # a socket the player has already stopped reading.
+        self.before_stop = None
         self._available = vlc_setup.ensure_vlc()
 
         self._switch_timer = QTimer(self)
@@ -238,6 +432,16 @@ class PlayerWidget(QWidget):
         self._countdown.timeout.connect(self._countdown_tick)
         self._countdown_left = 0
         self._up_next_mode = "next"
+
+        self._keepalive = _AudioKeepAlive()
+        # The keep-alive only runs around actual playback: started when a stream
+        # starts, stopped a short while after everything stops. That spans the
+        # pauses and channel-hops that pop the audio device without holding it
+        # open (and a Bluetooth sink awake) when the app is just sitting idle.
+        self._keepalive_off = QTimer(self)
+        self._keepalive_off.setSingleShot(True)
+        self._keepalive_off.setInterval(8000)
+        self._keepalive_off.timeout.connect(self._keepalive.stop)
 
         self._build_ui()
 
@@ -260,8 +464,9 @@ class PlayerWidget(QWidget):
         self._stack.setContentsMargins(0, 0, 0, 0)
 
         self.surface = VideoSurface()
-        # Not wired straight to fullscreen: what a double-click should do
+        # Not wired to pause/seek/fullscreen here: what a click should do
         # depends on the window mode, which only MainWindow knows.
+        self.surface.clicked.connect(self.videoClicked)
         self.surface.doubleClicked.connect(self.videoDoubleClicked)
 
         self.overlay = QLabel("")
@@ -296,22 +501,17 @@ class PlayerWidget(QWidget):
             "--network-caching=1500",
             "--http-reconnect",
             "--no-snapshot-preview",
-            "--quiet",
+            # IPTV_VLC_DEBUG=1 turns libVLC's own log on, for chasing vout trouble.
+            "--verbose=2" if os.environ.get("IPTV_VLC_DEBUG") else "--quiet",
         ]
         if not self._hw_enabled():
             args.append("--avcodec-hw=none")
+        args += _linux_audio_args()
         self.instance = vlc.Instance(*args)
         self.player = self.instance.media_player_new()
         self._attach_surface()
         self._attach_events()
-        # libVLC puts its own view over the surface and would otherwise eat
-        # mouse and key events, so double-click-to-fullscreen never reaches
-        # Qt. Hand input back to us.
-        try:
-            self.player.video_set_mouse_input(False)
-            self.player.video_set_key_input(False)
-        except Exception:
-            pass
+        self._disown_input()
         self.player.audio_set_volume(self.bar.volume.value())
         self._apply_engine_settings()
 
@@ -338,6 +538,23 @@ class PlayerWidget(QWidget):
         if self._equalizer_state is not None:
             self.set_equalizer(*self._equalizer_state)
         self.set_video_adjust(self._adjust)
+
+    def _disown_input(self):
+        """Tell libVLC not to consume mouse and key events on its video window.
+
+        Without this, libVLC's own view over the surface eats the wheel (volume
+        / seek), double-click-to-fullscreen and the shortcut keys before Qt
+        sees them. On X11/XWayland libVLC builds a fresh video window for each
+        media, and it comes back grabbing input, so this is re-stated on every
+        playback start rather than only at engine creation.
+        """
+        if self.player is None:
+            return
+        try:
+            self.player.video_set_mouse_input(False)
+            self.player.video_set_key_input(False)
+        except Exception:
+            pass
 
     def _hw_enabled(self) -> bool:
         return getattr(self, "_hw_pref", True)
@@ -473,6 +690,12 @@ class PlayerWidget(QWidget):
             return
         url, title, is_live, resume_secs = self._pending
         self._pending = None
+        if url != self._current_url:
+            self._drop_retries = 0
+            self._drop_at = -1
+        self._last_position = self._last_duration = 0
+        self._volume_sync = VOLUME_SYNC_TICKS
+        self._subtitle_sync = SUBTITLE_SYNC_TICKS
         self._current_url = url
         self._current_title = title
         self._is_live = is_live
@@ -489,8 +712,12 @@ class PlayerWidget(QWidget):
             media.release()
             self.player.play()
             # Rate and the video filters are reset by a new media, so they are
-            # re-stated here rather than only at engine creation.
+            # re-stated here rather than only at engine creation - and so is the
+            # input handoff, since libVLC's new video window grabs it again.
             self._apply_engine_settings()
+            self._disown_input()
+            self._keepalive_off.stop()
+            self._keepalive.start()
             self._poll.start()
             self._claim_focus()
             self.playbackStarted.emit()
@@ -637,6 +864,11 @@ class PlayerWidget(QWidget):
         # ⏹ while the card is up means "no thanks". The end-of-episode path
         # stops first and shows the card after, so this is a no-op there.
         self.hide_up_next()
+        if self.before_stop is not None:
+            try:
+                self.before_stop()
+            except Exception:
+                pass
         if self.player is not None:
             try:
                 self.player.stop()
@@ -647,6 +879,9 @@ class PlayerWidget(QWidget):
         self._ab = (None, None)
         self.bar.reset()
         self.overlay.hide()
+        # Let the device idle only after a grace period - a stop is very often
+        # the front half of a channel change.
+        self._keepalive_off.start()
         self.playbackStopped.emit()
 
     def toggle_pause(self):
@@ -659,6 +894,11 @@ class PlayerWidget(QWidget):
             return
         self.player.pause()
         self.bar.set_playing(bool(self.player.is_playing()))
+
+    @property
+    def has_media(self) -> bool:
+        """Something is loaded and the video area is showing it (no card)."""
+        return self.player is not None and bool(self._current_url) and not self.up_next_showing
 
     def is_playing(self) -> bool:
         try:
@@ -733,6 +973,7 @@ class PlayerWidget(QWidget):
 
         if playing:
             self.overlay.hide()
+            self._sync_after_start()
         self.bar.set_playing(bool(playing))
 
         self._seekable = bool(length and length > 0 and not self._is_live)
@@ -746,11 +987,102 @@ class PlayerWidget(QWidget):
 
         position = max(0, current // 1000)
         duration = max(0, length // 1000)
+        if current >= 0:
+            self._last_position = position
+        if duration > 0:
+            self._last_duration = duration
         self._enforce_ab_loop(position)
         self.bar.update_position(position, duration, self._seekable)
 
         if self._seekable:
             self.positionChanged.emit(current / length, position, duration)
+
+    def _sync_after_start(self):
+        """Re-state what a fresh media forgets, once it is actually playing.
+
+        Volume: libVLC only owns a level once the audio output exists, and on
+        PulseAudio the output arrives with the server's remembered level, which
+        it then reports back over ours. Subtitles: the track the user picked on
+        the previous episode, matched by name because the ids are per media,
+        and failing that whichever track is labelled English.
+        Both are retried for a few ticks since the ES arrive after "playing".
+        """
+        if self._volume_sync > 0:
+            self._volume_sync -= 1
+            want = int(self.bar.volume.value())
+            try:
+                if self.player.audio_get_volume() != want:
+                    self.player.audio_set_volume(want)
+                self.player.audio_set_mute(self._muted)
+            except Exception:
+                pass
+        if self._subtitle_sync > 0:
+            self._subtitle_sync -= 1
+            if self._apply_preferred_subtitle():
+                self._subtitle_sync = 0
+
+    def _apply_preferred_subtitle(self) -> bool:
+        tracks = [(tid, name) for tid, name in self.subtitle_tracks() if tid >= 0]
+        if not tracks:
+            return False
+        want = self._preferred_subtitle
+        target = -1
+        if want:
+            # The track chosen last time, by name: the same series ships the
+            # same track labels from one episode to the next.
+            target = match_track(want, tracks)
+            if target is None:
+                target = english_track(tracks)
+        elif want is None:
+            # Nothing chosen yet: English is the default whenever there is one.
+            target = english_track(tracks)
+        if target is None:
+            return False
+        try:
+            if self.player.video_get_spu() != target:
+                self.player.video_set_spu(target)
+        except Exception:
+            pass
+        return True
+
+    @property
+    def preferred_subtitle(self):
+        return self._preferred_subtitle
+
+    def set_preferred_subtitle(self, name):
+        """The track name to pick on every new media (None to stop doing so)."""
+        self._preferred_subtitle = name
+        self._subtitle_sync = SUBTITLE_SYNC_TICKS
+
+    # ------------------------------------------------------- dropped stream
+
+    def ended_early(self) -> bool:
+        """EndReached arrived with most of the file still to play.
+
+        A VOD that stops well short of its duration has lost its connection;
+        treating that as the end would skip to the next episode mid-scene.
+        """
+        if self._is_live or not self._seekable:
+            return False
+        if self._last_duration <= 0:
+            return False
+        if self._last_duration - self._last_position <= EARLY_END_SLACK_S:
+            return False
+        # Progress since the last drop resets the budget; the same spot dying
+        # again and again does not.
+        if self._drop_at < 0 or self._last_position > self._drop_at + EARLY_END_SLACK_S:
+            self._drop_retries = 0
+        return self._drop_retries < EARLY_END_RETRIES
+
+    def resume_after_drop(self):
+        """Reopen the same stream a couple of seconds before where it died."""
+        self._drop_retries += 1
+        self._drop_at = self._last_position
+        resume = max(0, self._last_position - 2)
+        url, title, live = self._current_url, self._current_title, self._is_live
+        self.play(url, title, live, resume_secs=resume)
+        self.overlay.setText(f"Reconnecting… ({self._drop_retries}/{EARLY_END_RETRIES})")
+        self.overlay.show()
 
     # ------------------------------------------------------------ A-B loop
 
@@ -989,6 +1321,14 @@ class PlayerWidget(QWidget):
                 self.player.video_set_spu(int(track_id))
             except Exception:
                 pass
+        # A deliberate choice from the menu carries over to the next episode.
+        names = dict(self.subtitle_tracks())
+        if int(track_id) < 0:
+            self._preferred_subtitle = ""
+        elif int(track_id) in names:
+            self._preferred_subtitle = names[int(track_id)]
+        self._subtitle_sync = 0
+        self.subtitlePreferenceChanged.emit(self._preferred_subtitle)
 
     def set_audio_track(self, track_id: int):
         if self.player is not None:
@@ -1007,4 +1347,6 @@ class PlayerWidget(QWidget):
     def shutdown(self):
         self._poll.stop()
         self._switch_timer.stop()
+        self._keepalive_off.stop()
+        self._keepalive.stop()
         self._release_player()

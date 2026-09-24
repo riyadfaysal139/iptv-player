@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QModelIndex, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QHBoxLayout, QLabel, QListView, QPushButton,
@@ -25,9 +25,13 @@ from ui.gridnav import move_cursor
 from ui.models import (
     POSTER_H, POSTER_W, ROLE_ITEM, ROLE_KIND, CatalogModel, PosterDelegate,
 )
+from ui.continue_rail import ContinueRail
+from ui.hero_panel import HeroPanel
 from ui.scrollarea import BoundedScrollArea
 
 ROW_CAP = 20            # posters per rail
+FAVOURITES_ROWS = 3     # Favourites wraps onto this many rows under one heading
+FAVOURITES_CAP = 36     # enough posters to fill those rows on a wide screen
 GENRE_ROWS = 5          # how many of the provider's genres get a rail
 MIN_RAIL = 6            # below this it is not a row, it is a gap
 MAX_RAILS = 11          # the first page: a wall you scroll, not one you get lost in
@@ -53,6 +57,19 @@ FAR_END = 10 ** 6       # Home/End, expressed as a move the clamp absorbs
 # take these rows unchanged.
 COLUMNS = ("s.stream_id, s.name, s.icon, s.rating, s.container_extension, "
            "s.num, s.available, s.epg_channel_id, s.added")
+
+
+def pretty_heading(title: str) -> str:
+    """"CONTINUE WATCHING" reads as "Continue Watching" on the wall.
+
+    The section data stays upper-case (keys, tests and the sidebar all agree
+    on it); only the painted heading softens. Two-letter words are left as
+    they are, so TV, UK and US keep their capitals.
+    """
+    words = []
+    for word in (title or "").split(" "):
+        words.append(word if len(word) <= 2 else word[:1].upper() + word[1:].lower())
+    return " ".join(words)
 
 
 def _rows(db, sql, params):
@@ -434,8 +451,8 @@ def home_sections(db, playlist_id, cap: int = ROW_CAP, genres: int = GENRE_ROWS)
             seen.add(section[0])
             out.append(section)
 
-    for key in ("continue", "favourites"):
-        add(_personal_section(db, playlist_id, key, cap))
+    add(_personal_section(db, playlist_id, "continue", cap))
+    add(_personal_section(db, playlist_id, "favourites", max(cap, FAVOURITES_CAP)))
 
     # Your choices, after your history and before anything the app guessed.
     pinned_targets = set()
@@ -505,6 +522,27 @@ class RailDelegate(PosterDelegate):
         hint = super().sizeHint(option, index)
         return QSize(hint.width() + 2 * GROW_X, hint.height() + 2 * GROW_Y)
 
+    def hit_rect(self, option_rect: QRect, option=None, index=None) -> QRect:
+        """The heart as drawn: the cursor's poster is painted scaled about
+        the cell's centre, which moves its corner heart by a poster-corner's
+        worth - enough to miss the click unless the hit area moves with it.
+
+        The option handed to editorEvent does not carry the selected state,
+        so the cursor is read from the view (the delegate's parent rail)."""
+        inner = option_rect.adjusted(GROW_X, GROW_Y, -GROW_X, -GROW_Y)
+        rect = self.heart_rect(inner)
+        selected = bool(option is not None and option.state & QStyle.State_Selected)
+        view = getattr(self.parent(), "view", None)
+        if not selected and index is not None and view is not None:
+            selected = view.currentIndex() == index
+        if selected:
+            centre = option_rect.center()
+            scale = FOCUS_SCALE
+            left = centre.x() + (rect.left() - centre.x()) * scale
+            top = centre.y() + (rect.top() - centre.y()) * scale
+            rect = QRect(int(left), int(top), int(rect.width() * scale), int(rect.height() * scale))
+        return rect
+
     def paint(self, painter, option, index):
         inner = QStyleOptionViewItem(option)
         inner.rect = option.rect.adjusted(GROW_X, GROW_Y, -GROW_X, -GROW_Y)
@@ -550,6 +588,8 @@ class HomeRail(QWidget):
     """One horizontal row of posters, scrolling sideways."""
 
     activated = Signal(str, object)      # kind, row
+    favouriteToggled = Signal(str, object)   # kind, row: the poster's heart
+    menuRequested = Signal(str, object, object)   # kind, row, global position
     seeAllRequested = Signal(object)     # (kind, node_type, payload)
     unpinRequested = Signal(object)      # (kind, node_type, payload)
     cursorRequested = Signal(str, int)   # rail key, column
@@ -613,13 +653,18 @@ class HomeRail(QWidget):
         self.view.setSelectionMode(QListView.SingleSelection)
         self.view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.view.setHorizontalScrollMode(QListView.ScrollPerPixel)
-        self.view.setFixedHeight(POSTER_H + 40 + 2 * GROW_Y
-                                 + self.view.spacing() * 2 + 14)
-        self.view.setItemDelegate(RailDelegate(images, lambda: self.model, self))
+        self._row_height = POSTER_H + 40 + 2 * GROW_Y + self.view.spacing() * 2
+        self._max_rows = 1
+        self.view.setFixedHeight(self._row_height + 14)
+        delegate = RailDelegate(images, lambda: self.model, self)
+        delegate.favouriteToggled.connect(self._heart_clicked)
+        self.view.setItemDelegate(delegate)
         # Double-click, not single: a rail is dragged sideways, and a drag that
         # ends in a click would otherwise start playing something.
         self.view.doubleClicked.connect(self._activated)
         self.view.pressed.connect(self._pressed)
+        self.view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._context_menu)
         box.addWidget(self.view)
 
     def _move_button(self, glyph: str, delta: int, tip: str) -> QPushButton:
@@ -635,6 +680,19 @@ class HomeRail(QWidget):
         row = index.data(ROLE_ITEM)
         if row is not None:
             self.activated.emit(index.data(ROLE_KIND) or "movie", row)
+
+    def _heart_clicked(self, index):
+        row = index.data(ROLE_ITEM)
+        if row is not None:
+            self.favouriteToggled.emit(index.data(ROLE_KIND) or "movie", row)
+
+    def _context_menu(self, point):
+        index = self.view.indexAt(point)
+        row = index.data(ROLE_ITEM) if index.isValid() else None
+        if row is not None:
+            self.cursorRequested.emit(self.key, index.row())
+            self.menuRequested.emit(index.data(ROLE_KIND) or "movie", row,
+                                    self.view.viewport().mapToGlobal(point))
 
     def _pressed(self, index):
         """A click puts the cursor where you clicked, and the keyboard here."""
@@ -678,19 +736,49 @@ class HomeRail(QWidget):
     def set_rows(self, rows, kinds):
         self.model.set_rows(rows, kinds[0] if kinds else "movie", set(), kinds)
         self.setVisible(bool(rows))
+        self._fit_rows()
 
     def rows(self) -> int:
         return self.model.rowCount()
+
+    def set_max_rows(self, rows: int):
+        """Let the rail wrap onto up to `rows` lines under its one heading."""
+        self._max_rows = max(1, int(rows))
+        self.view.setWrapping(self._max_rows > 1)
+        # Re-flow on every resize, or IconMode keeps the column count it had
+        # when first laid out - one poster per line, from a viewport that
+        # was still zero wide.
+        self.view.setResizeMode(QListView.Adjust if self._max_rows > 1 else QListView.Fixed)
+        self.view.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff if self._max_rows > 1 else Qt.ScrollBarAsNeeded)
+        self._fit_rows()
+
+    def _fit_rows(self):
+        """Size the view to the lines its posters need, capped at the max."""
+        if self._max_rows <= 1:
+            return
+        cell_w = POSTER_W + 14 + 2 * GROW_X + self.view.spacing() * 2
+        columns = max(1, self.view.viewport().width() // cell_w)
+        needed = -(-self.rows() // columns)           # ceil
+        lines = max(1, min(self._max_rows, needed))
+        self.view.setFixedHeight(lines * self._row_height + 14)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_rows()
 
 
 class HomePage(QWidget):
     """The wall of rails, rebuilt each time it is opened."""
 
     itemActivated = Signal(str, object)      # kind, row
+    favouriteToggled = Signal(str, object)   # kind, row
+    menuRequested = Signal(str, object, object)   # kind, row, global position
     seeAllRequested = Signal(object)         # (kind, node_type, payload)
     unpinRequested = Signal(object)          # (kind, node_type, payload)
     moveRequested = Signal(str, int)         # rail key, -1 up / +1 down
     moreRequested = Signal()                 # the bottom of the wall is in sight
+    cursorChanged = Signal(str, object)      # kind, row: what the billboard shows
 
     def __init__(self, images, parent=None):
         super().__init__(parent)
@@ -698,6 +786,10 @@ class HomePage(QWidget):
         self.setObjectName("homePage")
         self.rails = {}
         self._order = []
+        self._titles = {}
+        # What Continue Watching knows about each row (progress, episode,
+        # still); set by the window, which owns the database.
+        self.meta_provider = None
         # (rail key, column), plus the rail's position for the case where the
         # key itself is gone by the next rebuild.
         self._cursor = None
@@ -730,8 +822,12 @@ class HomePage(QWidget):
             lambda _value: self.request_more())
 
         self.root = QVBoxLayout(body)
-        self.root.setContentsMargins(24, 20, 24, 28)
-        self.root.setSpacing(18)
+        self.root.setContentsMargins(0, 0, 0, 28)
+        self.root.setSpacing(12)
+
+        # The billboard: whatever the cursor is on, large, above the rails.
+        self.hero = HeroPanel(self.images)
+        self.root.addWidget(self.hero)
 
         self.empty = QLabel("")
         self.empty.setObjectName("homeEmpty")
@@ -790,18 +886,31 @@ class HomePage(QWidget):
         for key, title, rows, kinds, target in sections:
             rail = self.rails.get(key)
             if rail is None:
-                rail = HomeRail(key, title, self.images)
+                if key == "continue":
+                    rail = ContinueRail(key, title, self.images)
+                    rail.meta_provider = self.meta_provider
+                else:
+                    rail = HomeRail(key, title, self.images)
+                    if key == "favourites":
+                        # One heading, a few lines: the list you curated is
+                        # worth more of the wall than a single strip.
+                        rail.set_max_rows(FAVOURITES_ROWS)
                 rail.activated.connect(self.itemActivated)
+                rail.favouriteToggled.connect(self.favouriteToggled)
+                rail.menuRequested.connect(self.menuRequested)
                 rail.seeAllRequested.connect(self.seeAllRequested)
                 rail.unpinRequested.connect(self.unpinRequested)
                 rail.cursorRequested.connect(self._cursor_pressed)
                 rail.moveRequested.connect(self.moveRequested)
                 self.rails[key] = rail
-            rail.heading.setText(title)
+            self._titles[key] = title
+            rail.heading.setText(pretty_heading(title))
             rail.set_target(target, pinned=key.startswith("pin_"))
             rail.set_rows(rows, kinds)
-            # Insert before the trailing stretch, in the order given.
-            self.root.insertWidget(len(self._order) + 1, rail)
+            # Insert before the trailing stretch, in the order given, after
+            # the billboard and the empty-wall note.
+            rail.setContentsMargins(24, 0, 24, 0)
+            self.root.insertWidget(len(self._order) + 2, rail)
             self._order.append(key)
         self._sync_move_buttons()
 
@@ -868,13 +977,17 @@ class HomePage(QWidget):
         return list(self._order)
 
     def rail_title(self, key: str) -> str:
-        rail = self.rails.get(key)
-        return rail.heading.text() if rail is not None else key
+        return self._titles.get(key, key)
 
     def _image_arrived(self, _url):
+        self.repaint_rails()
+
+    def repaint_rails(self):
         for rail in self.rails.values():
             if rail.isVisible():
                 rail.view.viewport().update()
+                if hasattr(rail, "repaint_cards"):
+                    rail.repaint_cards()
 
     # ----------------------------------------------------------- the cursor
 
@@ -921,6 +1034,20 @@ class HomePage(QWidget):
             rail.set_cursor(column if key == self._cursor[0] else None)
         if scroll:
             self.ensure_visible()
+        self._announce_cursor()
+
+    def _announce_cursor(self):
+        """Tell the window what the billboard should show now."""
+        if self._cursor is None:
+            return
+        key, column = self._cursor
+        rail = self.rails.get(key)
+        if rail is None or not 0 <= column < rail.rows():
+            return
+        index = rail.model.index(column, 0)
+        row = index.data(ROLE_ITEM)
+        if row is not None:
+            self.cursorChanged.emit(index.data(ROLE_KIND) or "movie", row)
 
     def ensure_visible(self):
         """Follow the cursor sideways along its rail, and down the wall."""

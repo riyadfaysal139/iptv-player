@@ -320,6 +320,7 @@ def _audio(p, c):
     p.drawEllipse(QPointF(68, 62), 14, 12)
 
 
+
 SHAPES = {
     "play": _play,
     "pause": _pause,

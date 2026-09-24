@@ -61,6 +61,35 @@ distribution's equivalent.
 > `sudo apt install libfuse2`, or use the `.tar.gz` instead: extract it and run
 > `IPTVPlayer/IPTVPlayer`, which needs nothing extra.
 
+> **Audio cuts out, crackles on pause, or loses its first second, on PipeWire.**
+> The app pins libVLC's PulseAudio output so playback follows the system default
+> sink like a browser does, instead of libVLC grabbing one ALSA device
+> directly. It also runs a silent keep-alive stream around playback (through the
+> first few seconds after a stop, spanning pauses and channel changes) so an
+> HDMI/S-PDIF codec never powers down mid-session and pops when it wakes. If a
+> stream still drops its start when nothing has played for a while, stop the
+> sink suspending at all:
+>
+> ```
+> # ~/.config/wireplumber/wireplumber.conf.d/51-no-suspend.conf
+> monitor.alsa.rules = [
+>   { matches = [ { node.name = "~alsa_output.*" } ]
+>     actions = { update-props = { session.suspend-timeout-seconds = 0 } } }
+> ]
+> ```
+>
+> then `systemctl --user restart wireplumber`. On classic PulseAudio the
+> equivalent is commenting out `load-module module-suspend-on-idle` in
+> `/etc/pulse/default.pa`.
+
+> **KDE Wallet keeps asking for a password.** Credentials are now read once per
+> session rather than on every stream start, which cuts the prompts right down
+> — and **Settings ▸ Store passwords in the system keychain** can be switched
+> *off* to keep them in the app's own database instead (obfuscated, in your
+> private config dir), so the wallet is never opened at all. Toggling it moves
+> the existing credentials across; a locked wallet you dismiss just means
+> re-entering them.
+
 Built on Ubuntu 22.04 (glibc 2.35), so it runs on Ubuntu 22.04+, Debian 12+,
 Mint 21+ and equivalents. To get a desktop menu entry, use any AppImage
 integrator (Gear Lever, AppImageLauncher) or copy
@@ -421,10 +450,11 @@ channel list. Whoever has focus gets them:
 - **Typing in a search box** — always the box. `Space` inserts a space and the
   arrows move the caret; the player does not interfere.
 
-The status bar says which happened (`Seek +10s`, `Volume 80%`), so there is no
-guessing about where focus is. In fullscreen the status bar is hidden, so a
-keypress pops the floating control bar up instead — it shows the new position
-and volume, then fades out again.
+A caption over the video says what happened (`Seek +10s`, `Volume 145%`) — VLC's
+own OSD, shown the same way windowed, fullscreen and in Picture-in-Picture. The
+status bar echoes it when the window has one, and in fullscreen a keypress also
+pops the floating control bar up so its slider and clock catch up. Volume runs
+to **200%**, VLC's ceiling; 100% is unity and above it boosts.
 
 **The mouse wheel changes the volume too**, whenever it is over the video —
 windowed, fullscreen, or Picture-in-Picture — the same step as the volume
@@ -432,6 +462,8 @@ slider itself and shown the same way. Unlike the arrow keys this needs no
 focus, just hover: the video is never reparented for fullscreen or PiP, so
 hovering it reaches the same handling everywhere. It stays out of the way
 everywhere else — scroll the catalog list or the homepage and only they move.
+Hold **Shift** and the wheel seeks instead (±10 s), and the wheel over the
+**scrub bar** always seeks (±5 s a notch) — both as VLC does.
 
 **Adjustments and Effects** (the ⚙ button) is VLC's panel: a 10-band equaliser
 with all 18 of VLC's presets and a preamp, and video adjustment for contrast,

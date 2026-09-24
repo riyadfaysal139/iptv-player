@@ -124,8 +124,13 @@ class ChipButton(QPushButton):
         menu.exec(self.mapToGlobal(QPoint(0, -height)))
 
 
+WHEEL_SEEK_SECONDS = 5      # one wheel notch over the timeline, as VLC's short jump
+
+
 class SeekSlider(QSlider):
     """Click-anywhere-to-seek, with VLC's hover preview of the target time."""
+
+    seekRequested = Signal(int)   # relative jump in seconds, from the wheel
 
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
@@ -137,6 +142,19 @@ class SeekSlider(QSlider):
 
     def set_duration(self, seconds: int):
         self._duration = max(0, int(seconds or 0))
+
+    def wheelEvent(self, event):
+        # QSlider's own wheelEvent nudges the value but never emits
+        # sliderPressed/Released, which is the only path the bar turns into a
+        # seek - so a bare wheel over the timeline looks dead. Translate it into
+        # a relative jump instead, matching VLC's wheel-over-timeline.
+        if not self.isEnabled():
+            event.ignore()
+            return
+        notches = event.angleDelta().y() / 120.0
+        if notches:
+            self.seekRequested.emit(int(round(notches)) * WHEEL_SEEK_SECONDS)
+        event.accept()
 
     def _fraction_at(self, x: int) -> float:
         value = QStyle.sliderValueFromPosition(0, 1000, x, max(1, self.width()))
@@ -166,7 +184,7 @@ class VolumeSlider(QSlider):
     def __init__(self, parent=None):
         super().__init__(Qt.Horizontal, parent)
         self.setObjectName("volumeSlider")
-        self.setRange(0, 125)          # VLC allows boosting past 100
+        self.setRange(0, 200)          # VLC's own ceiling; 100 is unity, above it boosts
         self.setValue(85)
         self.setSingleStep(5)
         self.setPageStep(10)
@@ -224,6 +242,7 @@ class TransportBar(QWidget):
         self.seek.setEnabled(False)
         self.seek.sliderPressed.connect(self._seek_pressed)
         self.seek.sliderReleased.connect(self._seek_released)
+        self.seek.seekRequested.connect(self._wheel_seek)
         self._seeking = False
 
         self.total_label = QLabel("--:--")
@@ -354,6 +373,12 @@ class TransportBar(QWidget):
         self._seeking = False
         self.player.seek_fraction(self.seek.value() / 1000.0)
 
+    def _wheel_seek(self, seconds: int):
+        # The timeline wheel. A no-op on a live stream, which the slider is
+        # disabled for anyway, so this is only reached on seekable media.
+        if not self.player.seek_relative(seconds):
+            self.message.emit("Live stream — cannot seek")
+
     def _toggle_time_display(self, event):
         self._show_remaining = not self._show_remaining
         self.player.refresh_now()
@@ -421,6 +446,7 @@ class TransportBar(QWidget):
 
     def _volume_changed(self, value: int):
         self.player.set_volume(value)
+        self.volume.setToolTip(f"Volume {value}%")
         if self.player.is_muted() and value > 0:
             self.player.set_muted(False)
             self.btn_mute.set_glyph("volume", icons.FG)

@@ -15,7 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QEvent, QObject, QRect, QSize, Qt, QThread, QTimer, Signal,
 )
-from PySide6.QtGui import QAction, QCursor, QKeySequence
+from PySide6.QtGui import QAction, QCursor, QKeySequence, QWindow
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QTabBar, QTextEdit, QVBoxLayout, QWidget,
 )
 
+from core import playlists as playlists_mod
 from core import sync as sync_mod
 from core import vlc_setup
 from core.db import Database, fold
@@ -37,21 +38,26 @@ from ui.home_page import (
     more_sections, pin_keys, pin_rail, save_order, unpin_rail,
 )
 from ui.models import (
-    ROLE_ITEM, CatalogModel, ChannelDelegate, ImageCache, PosterDelegate,
+    ROLE_ITEM, ROLE_KIND, CatalogModel, ChannelDelegate, ImageCache, PosterDelegate,
 )
 from ui.player_widget import PlayerWidget
 from ui.playlist_dialog import PlaylistEditor, PlaylistManager
 from ui.search_page import SearchPage, search_catalog
 from ui.series_page import SeriesPage, episode_caption, next_episode
 from ui.subtitle_dialog import SubtitleDialog
+from ui.fullscreen_drawer import FullscreenDrawer
+from ui.edge_strips import EdgeStrips
+from core.db import app_dir
+from core.streamcache import DEFAULT_LIMIT_GB, StreamCache
 
-TABS = [("live", "TV"), ("movie", "MOVIES"), ("series", "SERIES")]
+TABS = [("live", "TV"), ("movie", "Movies"), ("series", "Series")]
 EXPIRY_WARN_DAYS = 7
 EPG_CACHE_SECONDS = 300        # now/next only moves every half hour
 RESOLVED_TTL_SECONDS = 45      # CDN tokens verified good at 25 s; stay well inside
 PREFETCH_DELAY_MS = 180        # let arrow-key scrolling settle before resolving
 SEEK_STEP_SECONDS = 10         # VLC's short jump, on the left/right arrows
 VOLUME_STEP = 5                # matches the wheel step over the volume slider
+FULLSCREEN_BAR_OPACITY = 0.74  # the floating bar lets the picture show through
 PIP_WIDTH = 560                # the main row of the bar needs ~490px to fit
 PIP_MARGIN = 24
 # What the splitter opens the video pane at. The docked transport bar's minimum
@@ -216,14 +222,63 @@ class ThreadedTask:
         cls._live.clear()
 
 
+class _BarOverlay(QWidget):
+    """The floating fullscreen control bar's window.
+
+    Reports wheel notches that none of the bar's own widgets took (the volume
+    slider keeps its own), so the bar can double as the drawer's handle.
+    """
+
+    wheeled = Signal(int)
+
+    def __init__(self):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
+
+    def paintEvent(self, event):
+        # A QWidget *subclass* gets no stylesheet background for free — Qt only
+        # paints it for a plain QWidget. Without this the glass tint (and the
+        # old opaque panel) silently vanish and the bar floats on nothing.
+        from PySide6.QtGui import QPainter
+        from PySide6.QtWidgets import QStyle, QStyleOption
+
+        option = QStyleOption()
+        option.initFrom(self)
+        painter = QPainter(self)
+        self.style().drawPrimitive(QStyle.PE_Widget, option, painter, self)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta:
+            self.wheeled.emit(delta)
+        event.accept()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, db: Database):
         super().__init__()
         self.db = db
         self.store = PlaylistStore(db)
+
+        # Where credentials live: the OS keychain by default, or an obfuscated
+        # table in this database when the keychain's unlock prompt is unwanted.
+        # Applied before anything reads a password.
+        pref = self.db.get_setting("credential_store", "")
+        if pref == "local" or (not pref and not playlists_mod._KEYRING_OK):
+            playlists_mod.use_local_store(self.db)
+
         self.playlist = self.store.active()
         self.kind = "live"
         self.images = ImageCache(self)
+        # Every poster's heart asks this: (kind, stream_id) in the favourites
+        # table, cached and refreshed on each toggle and playlist change.
+        self._favourite_keys = set()
+        CatalogModel.favourite_lookup = staticmethod(
+            lambda kind, stream_id: (kind, stream_id) in self._favourite_keys)
+        # The play-through disk cache. Its HTTP server only starts on first use.
+        self.stream_cache = StreamCache(
+            app_dir() / "stream-cache",
+            self.db.get_int("stream_cache_limit_gb", DEFAULT_LIMIT_GB) * 1024 ** 3)
         self._sync_thread = None
         self._episode_thread = None
         self._current_item = None
@@ -242,6 +297,9 @@ class MainWindow(QMainWindow):
         self._sidebar_width = SIDEBAR_WIDTH   # what it opens back at
         self._player_width = PLAYER_PANE_WIDTH
         self._fs_overlay = None
+        self._fs_drawer = None
+        self._fs_chevron = None
+        self._drawer_season = None      # the season the sheet is showing, if a show
         self._pip_state = None
         self._pip_hold_ms = 0
         self._current_episode = None
@@ -254,6 +312,13 @@ class MainWindow(QMainWindow):
         self._playing_kind = None        # the kind of what is playing, not of the tab
         self._up_next = None
         self._up_next_url = ""
+
+        # VLC-style on-screen display for volume/seek, drawn over the video.
+        # Built before the UI, which connects playbackStopped to _hide_osd.
+        self._osd = None
+        self._osd_timer = QTimer(self)
+        self._osd_timer.setSingleShot(True)
+        self._osd_timer.timeout.connect(lambda: self._osd and self._osd.hide())
 
         self.downloads = DownloadManager(db)
         self.downloads.start()
@@ -300,6 +365,20 @@ class MainWindow(QMainWindow):
             sel.currentChanged.connect(lambda *_: self._prefetch_timer.start())
 
         # Polls the pointer while fullscreen so the controls can auto-hide.
+        # The title bar's maximize button is read as "give me the whole
+        # screen": the window goes properly fullscreen (no frame, no panel).
+        # F11 / Esc / the View menu bring it back. Programmatic maximize
+        # calls (restoring after video fullscreen or PiP) mute the hook.
+        self._app_fullscreen = False
+        self._state_hook_muted = False
+        self._shown_at = time.monotonic()
+        # Screen-edge helpers for app fullscreen: window buttons at the top,
+        # the way to the taskbar at the bottom. Polled like the video bar is.
+        self._edges = None
+        self._edge_pos = None       # last pointer position seen in a mouse event
+        self._edge_timer = QTimer(self)
+        self._edge_timer.setInterval(120)
+        self._edge_timer.timeout.connect(self._edge_tick)
         self._fs_timer = QTimer(self)
         self._fs_timer.setInterval(400)
         self._fs_timer.timeout.connect(self._fs_tick)
@@ -337,29 +416,37 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.account_label)
         top_layout.addStretch(1)
 
-        self.home_button = QPushButton()
-        self.home_button.setObjectName("topBarButton")
-        self.home_button.setIcon(icons.icon("home", 19))
-        self.home_button.setIconSize(QSize(19, 19))
-        self.home_button.setFixedSize(34, 30)
-        self.home_button.setCursor(Qt.PointingHandCursor)
-        self.home_button.setFocusPolicy(Qt.NoFocus)
-        self.home_button.setToolTip("Home")
-        self.home_button.clicked.connect(self.open_home)
-        top_layout.addWidget(self.home_button)
+        # The navigation sits in the middle of the bar as a row of pills, the
+        # one you are on filled white: search, Home, TV, Movies, Series.
+        nav = QWidget()
+        nav.setObjectName("navBar")
+        nav_layout = QHBoxLayout(nav)
+        nav_layout.setContentsMargins(6, 3, 6, 3)
+        nav_layout.setSpacing(4)
 
         self.search_button = QPushButton()
         self.search_button.setObjectName("masterSearchButton")
         self.search_button.setIcon(icons.icon("search", 19))
         self.search_button.setIconSize(QSize(19, 19))
-        self.search_button.setFixedSize(34, 30)
+        self.search_button.setFixedSize(36, 32)
         self.search_button.setCursor(Qt.PointingHandCursor)
         self.search_button.setFocusPolicy(Qt.NoFocus)
         self.search_button.setToolTip("Search everything  (Ctrl+F)")
         self.search_button.clicked.connect(self.open_search)
-        top_layout.addWidget(self.search_button)
+        nav_layout.addWidget(self.search_button)
+
+        self.home_button = QPushButton("Home")
+        self.home_button.setObjectName("navPill")
+        self.home_button.setCursor(Qt.PointingHandCursor)
+        self.home_button.setFocusPolicy(Qt.NoFocus)
+        self.home_button.setToolTip("Home")
+        self.home_button.clicked.connect(self.open_home)
+        nav_layout.addWidget(self.home_button)
 
         self.tab_bar = QTabBar()
+        self.tab_bar.setObjectName("navTabs")
+        self.tab_bar.setDrawBase(False)
+        self.tab_bar.setExpanding(False)
         for _, label in TABS:
             self.tab_bar.addTab(label)
         self.tab_bar.currentChanged.connect(self._tab_changed)
@@ -368,7 +455,9 @@ class MainWindow(QMainWindow):
         # the homepage can be in the pane with the tab dimmed to say so, and
         # clicking it has to take you there.
         self.tab_bar.tabBarClicked.connect(self._tab_clicked)
-        top_layout.addWidget(self.tab_bar)
+        nav_layout.addWidget(self.tab_bar)
+        top_layout.addWidget(nav)
+        top_layout.addStretch(1)
         outer.addWidget(top)
 
         splitter = QSplitter(Qt.Horizontal)
@@ -418,6 +507,7 @@ class MainWindow(QMainWindow):
         self.list_view.clicked.connect(self._clicked_index)
         self.channel_delegate = ChannelDelegate(self.images, lambda: self.model, self)
         self.poster_delegate = PosterDelegate(self.images, lambda: self.model, self)
+        self.poster_delegate.favouriteToggled.connect(self.toggle_favourite)
         self.list_view.setItemDelegate(self.channel_delegate)
         self.stack.addWidget(self.list_view)
 
@@ -440,10 +530,29 @@ class MainWindow(QMainWindow):
         self.player.playbackStarted.connect(lambda: self.downloads.set_playback_active(True))
         self.player.playbackStopped.connect(lambda: self.downloads.set_playback_active(False))
         self.player.playbackStopped.connect(self._idle_timer.start)
+        self.player.playbackStopped.connect(self._hide_osd)
+        self.player.playbackStopped.connect(self.stream_cache.release)
+        self.player.before_stop = self.stream_cache.release
         self.player.endReached.connect(self._on_end_reached)
+        self.player.subtitlePreferenceChanged.connect(
+            lambda name: self.db.set_setting("subtitle_track", name or ""))
+        remembered = self.db.get_setting("subtitle_track", None)
+        if remembered is not None:
+            self.player.set_preferred_subtitle(remembered)
         self.player.positionChanged.connect(self._remember_position)
         self.player.fullscreenToggled.connect(self.toggle_fullscreen)
+        self.player.videoClicked.connect(self._video_clicked)
         self.player.videoDoubleClicked.connect(self._video_double_clicked)
+        # A click is only acted on once it is clear no second one is coming:
+        # reverting a pause or a seek after the fact is unreliable, since
+        # libVLC applies both asynchronously and the second toggle can read
+        # the state from before the first.
+        self._click_timer = QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(QApplication.doubleClickInterval())
+        self._click_timer.timeout.connect(self._single_click_settled)
+        self._click_x = 0.5
+        self.player.surface.wheelScrolled.connect(self._on_video_wheel)
         self.player.upNextRequested.connect(self._play_up_next)
         self.player.upNextDismissed.connect(self._dismiss_up_next)
         self._connect_transport(self.player.bar)
@@ -573,6 +682,20 @@ class MainWindow(QMainWindow):
         self.advanced_action.toggled.connect(self._toggle_advanced)
         view_menu.addAction(self.advanced_action)
 
+        self.app_fullscreen_action = QAction("Full screen window", self, checkable=True)
+        self.app_fullscreen_action.setShortcut(QKeySequence("F11"))
+        self.app_fullscreen_action.setToolTip(
+            "The whole app over the whole screen. The title bar's maximize\n"
+            "button does the same; Esc or F11 brings the frame back.")
+        self.app_fullscreen_action.triggered.connect(
+            lambda on: self.enter_app_fullscreen() if on else self.exit_app_fullscreen())
+        view_menu.addAction(self.app_fullscreen_action)
+        self.start_fullscreen_action = QAction("Start in full screen", self, checkable=True)
+        self.start_fullscreen_action.setChecked(self.db.get_bool("start_fullscreen", True))
+        self.start_fullscreen_action.toggled.connect(
+            lambda on: self.db.set_setting("start_fullscreen", "1" if on else "0"))
+        view_menu.addAction(self.start_fullscreen_action)
+
         browser = QAction("Show browser", self, checkable=True)
         browser.setChecked(True)
         browser.setShortcut(QKeySequence("Ctrl+L"))
@@ -633,10 +756,32 @@ class MainWindow(QMainWindow):
             lambda on: self.db.set_setting("autoplay_next", "1" if on else "0"))
         settings_menu.addAction(self.autoplay_action)
 
+        self.cache_action = QAction("Cache streams to disk while playing", self, checkable=True)
+        self.cache_action.setChecked(self.db.get_bool("cache_streams", True))
+        self.cache_action.setToolTip(
+            "Films and episodes play at once but are also saved to a temporary\n"
+            "cache, so a dropped connection is patched over and replays are free.")
+        self.cache_action.toggled.connect(
+            lambda on: self.db.set_setting("cache_streams", "1" if on else "0"))
+        settings_menu.addAction(self.cache_action)
+        settings_menu.addAction("Stream cache size…", self.choose_cache_size)
+        settings_menu.addAction("Clear stream cache", self.clear_stream_cache)
+
         self.autosync_action = QAction("Update catalog daily", self, checkable=True)
         self.autosync_action.setChecked(True)
         self.autosync_action.toggled.connect(self._toggle_autosync)
         settings_menu.addAction(self.autosync_action)
+
+        self.keychain_action = QAction("Store passwords in the system keychain",
+                                      self, checkable=True)
+        self.keychain_action.setChecked(not playlists_mod.local_store_active())
+        self.keychain_action.setEnabled(playlists_mod._KEYRING_OK)
+        self.keychain_action.setToolTip(
+            "Off: keep them in this app's database instead, so the keychain's "
+            "unlock prompt never appears."
+        )
+        self.keychain_action.toggled.connect(self._set_keychain_credentials)
+        settings_menu.addAction(self.keychain_action)
 
         settings_menu.addAction("Download folder…", self.choose_download_dir)
         settings_menu.addAction("Subtitles…", self.open_subtitles)
@@ -929,7 +1074,7 @@ class MainWindow(QMainWindow):
         """
         on_home = self.home_open
         on_search = self.search_open
-        self._light(self.home_button, on_home, glyph="home")
+        self._light(self.home_button, on_home)
         self._light(self.search_button, on_search, glyph="search")
         self._light(self.tab_bar, not (on_home or on_search), name="lit")
         self._sync_sidebar()
@@ -945,8 +1090,8 @@ class MainWindow(QMainWindow):
             return
         widget.setProperty(name, bool(on))
         if glyph:
-            widget.setIcon(icons.icon(glyph, 19,
-                                      icons.ACCENT if on else icons.FG))
+            # Lit pills are white, so the icon on one goes dark.
+            widget.setIcon(icons.icon(glyph, 19, "#0b0f2b" if on else icons.FG))
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
@@ -1071,6 +1216,7 @@ class MainWindow(QMainWindow):
             )
         }
         self.model.set_rows(rows, self.kind, favourites)
+        self._load_favourite_keys()
         self.statusBar().showMessage(f"{len(rows):,} items")
 
     # ------------------------------------------------------------ playback
@@ -1140,8 +1286,8 @@ class MainWindow(QMainWindow):
         self.live_badge.setVisible(is_live)
         self._play_original_url = url
         # Start the stream first; the guide fills in asynchronously behind it.
-        self.player.play(self._playable_url(url), name, is_live=is_live,
-                         resume_secs=resume, immediate=True)
+        self.player.play(self._cached_url(self._playable_url(url), ext, is_live),
+                         name, is_live=is_live, resume_secs=resume, immediate=True)
         self._load_epg(row, kind)
 
     def play_local(self, path: str, title: str):
@@ -1158,6 +1304,16 @@ class MainWindow(QMainWindow):
         self._clear_epg()
 
     def _on_player_error(self, message):
+        # If the cache proxy is what failed (an upstream with no length, say),
+        # fall back to the provider URL directly rather than just giving up.
+        current = self.player.current_url
+        direct = getattr(self, "_play_original_url", "")
+        if direct and self.stream_cache.is_local(current):
+            self.stream_cache.release()
+            self.statusBar().showMessage("Cache proxy failed — playing direct", 6000)
+            self.player.play(self._playable_url(direct), self.player.current_title,
+                             self.player.is_live)
+            return
         self.statusBar().showMessage(message, 8000)
 
     def _on_end_reached(self):
@@ -1166,7 +1322,11 @@ class MainWindow(QMainWindow):
         # endReached arrives from a libVLC thread through a queued signal, and
         # libVLC must not be re-entered from its own callback — the extra
         # event-loop hop guarantees it is well clear.
-        if bar.loop_mode == "one":
+        if self.player.ended_early():
+            # The socket died, not the episode: pick it back up where it was.
+            self.statusBar().showMessage("Stream dropped — reconnecting…", 8000)
+            QTimer.singleShot(0, self.player.resume_after_drop)
+        elif bar.loop_mode == "one":
             QTimer.singleShot(0, self.replay_current)
         elif bar.loop_mode == "all" or bar.shuffle:
             QTimer.singleShot(0, lambda: self.step_item(1))
@@ -1503,6 +1663,7 @@ class MainWindow(QMainWindow):
                        else self.menuBar().isVisible(),
             "statusbar": self.statusBar().isVisible(),
             "maximized": self.isMaximized(),
+            "app_fullscreen": self._app_fullscreen,
             "geometry": self.saveGeometry(),
             "advanced": self.player.bar.advanced_row.isVisible(),
         }
@@ -1535,6 +1696,114 @@ class MainWindow(QMainWindow):
         else:
             self.enter_fullscreen()
 
+    # --------------------------------------------------- app fullscreen
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() != QEvent.WindowStateChange or self._state_hook_muted:
+            return
+        if self._fs_state or self._pip_state or self._app_fullscreen:
+            return
+        was = event.oldState()
+        # Not during start-up: a window manager that remembers the window as
+        # maximized would otherwise launch the app straight into fullscreen.
+        if time.monotonic() - self._shown_at < 2.0:
+            return
+        if self.isMaximized() and not (was & Qt.WindowMaximized):
+            # Let the window manager finish its own transition first.
+            QTimer.singleShot(0, self.enter_app_fullscreen)
+
+    @property
+    def app_fullscreen(self) -> bool:
+        return self._app_fullscreen
+
+    def toggle_app_fullscreen(self):
+        if self._app_fullscreen:
+            self.exit_app_fullscreen()
+        else:
+            self.enter_app_fullscreen()
+
+    def enter_app_fullscreen(self):
+        """The whole application over the whole screen, frame and panel gone."""
+        if self._app_fullscreen or self._fs_state or self._pip_state:
+            return
+        self._app_fullscreen = True
+        self._state_hook_muted = True
+        self.showFullScreen()
+        self._state_hook_muted = False
+        if hasattr(self, "app_fullscreen_action"):
+            self.app_fullscreen_action.setChecked(True)
+        self._edge_timer.start()
+
+    def exit_app_fullscreen(self, maximized: bool = False):
+        if not self._app_fullscreen:
+            return
+        self._edge_timer.stop()
+        if self._edges is not None:
+            self._edges.hide()
+        self._app_fullscreen = False
+        self._state_hook_muted = True
+        if maximized:
+            self.showMaximized()
+        else:
+            self.showNormal()
+        self._state_hook_muted = False
+        if hasattr(self, "app_fullscreen_action"):
+            self.app_fullscreen_action.setChecked(False)
+
+    def _edge_tick(self):
+        """The pointer at the very top or bottom of a fullscreen app."""
+        if not self._app_fullscreen or self._fs_state or self._pip_state:
+            if self._edges is not None:
+                self._edges.hide()
+            return
+        if QApplication.activeModalWidget() is not None:
+            return
+        if self._edges is None:
+            self._edges = EdgeStrips(self)
+            self._edges.top.minimizeRequested.connect(self._minimize_from_fullscreen)
+            self._edges.top.restoreRequested.connect(self.exit_app_fullscreen)
+            self._edges.top.closeRequested.connect(self.close)
+            self._edges.bottom.taskbarRequested.connect(
+                lambda: self.exit_app_fullscreen(maximized=True))
+        # Fed from mouse events rather than QCursor.pos(): under XWayland the
+        # global pointer query is not reliable (measured: it can sit at 0,0
+        # while the mouse is anywhere), so the edges never triggered.
+        if self._edge_pos is None:
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.geometry() if screen else self.geometry()
+        available = screen.availableGeometry() if screen else area
+        self._edges.poll(self._edge_pos, area, available)
+
+    def _minimize_from_fullscreen(self):
+        """Minimise stays fullscreen underneath: restoring brings it straight back."""
+        if self._edges is not None:
+            self._edges.hide()
+        self._state_hook_muted = True
+        self.showMinimized()
+        self._state_hook_muted = False
+
+    def _restore_window_state(self, state: dict):
+        """Put the window back the way video fullscreen / PiP found it."""
+        self._state_hook_muted = True
+        try:
+            if state.get("app_fullscreen"):
+                # Straight back to the app's own fullscreen; the geometry
+                # saved on the way in was that same fullscreen rectangle.
+                self._app_fullscreen = True
+                self.showFullScreen()
+                if hasattr(self, "app_fullscreen_action"):
+                    self.app_fullscreen_action.setChecked(True)
+                self._edge_timer.start()
+                return
+            self.showNormal()
+            self.restoreGeometry(state["geometry"])
+            if state["maximized"]:
+                self.showMaximized()
+        finally:
+            self._state_hook_muted = False
+
     def enter_fullscreen(self):
         """Give the whole screen to the video.
 
@@ -1562,13 +1831,21 @@ class MainWindow(QMainWindow):
         # native window in place rather than recreating it, but if a platform
         # does recreate it, libVLC's drawable has to be re-bound.
         handle = int(self.player.surface.winId())
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        # Toggling a window *flag* makes Qt recreate the native window; on
+        # X11/Wayland that tears down the video surface's drawable and libVLC
+        # 3.x cannot move a running vout to the new handle, so the screen goes
+        # black. Window *state* changes (showFullScreen) don't recreate it, so
+        # the surface keeps its handle. The flag is only needed on Windows to
+        # hold the taskbar under the window; KWin/most WMs already raise a
+        # fullscreen window above panels.
+        if sys.platform.startswith("win"):
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.showFullScreen()
         if int(self.player.surface.winId()) != handle:
             self.player.reattach_surface()
         self._set_native_chrome(True)
         self._fill_screen()
-        self._float_bar()
+        self._float_bar(with_drawer=True)
         # The overlay is a separate top-level and takes activation with it, so
         # claim it back and put focus on the video — otherwise nothing holds
         # focus at all and the keyboard has no obvious owner.
@@ -1697,7 +1974,7 @@ class MainWindow(QMainWindow):
             return False
 
     def _float_bar(self, area=None, inset: int = 80, gap: int = 28,
-                   max_width: int = 1100):
+                   max_width: int = 1100, with_drawer: bool = False):
         """Put the controls over the video, the way VLC's fullscreen does.
 
         A separate top-level window is the only thing that reliably draws above
@@ -1720,11 +1997,16 @@ class MainWindow(QMainWindow):
         width = max(200, min(max_width, area.width() - inset))
         left = area.x() + (area.width() - width) // 2
 
-        overlay = QWidget(None, Qt.Tool | Qt.FramelessWindowHint
-                          | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
+        overlay = _BarOverlay()
         overlay.setObjectName("fullscreenBar")
         overlay.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        overlay.setWindowOpacity(0.96)
+        # Fullscreen proper is a see-through panel (Netflix / Prime style);
+        # the PiP mini window keeps its near-opaque bar. Whole-window opacity
+        # rather than per-pixel alpha, deliberately: the transport bar is a
+        # *native* child (Qt makes every sibling of the native video surface
+        # native), and a native child inside an ARGB window either paints
+        # black or, once re-created, routes clicks by stale positions.
+        overlay.setWindowOpacity(FULLSCREEN_BAR_OPACITY if with_drawer else 0.96)
         # Geometry before children: adding the bar first lets the layout size
         # the window to the bar's current (fullscreen-wide) hint, and Qt then
         # creates the native window off-screen on a multi-monitor desktop.
@@ -1732,15 +2014,34 @@ class MainWindow(QMainWindow):
 
         layout = QVBoxLayout(overlay)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.player.detach_bar())
+        layout.setSpacing(0)
+        bar = self.player.detach_bar()
+        layout.addWidget(bar)
+        if with_drawer:
+            # YouTube's pull-up handle: the row of other episodes (or similar
+            # films) lives behind it. The wheel over the bar does the same.
+            chevron = QPushButton("⌄")
+            chevron.setObjectName("drawerChevron")
+            chevron.setToolTip("More episodes / similar titles  (scroll down)")
+            chevron.setCursor(Qt.PointingHandCursor)
+            chevron.setFocusPolicy(Qt.NoFocus)
+            chevron.clicked.connect(self._toggle_drawer)
+            chevron.setFixedHeight(14)
+            layout.addWidget(chevron, 0, Qt.AlignHCenter)
+            layout.setContentsMargins(0, 0, 0, 2)
+            self._fs_chevron = chevron
+            overlay.wheeled.connect(self._bar_wheeled)
         overlay.setFixedWidth(width)
 
         overlay.show()
         overlay.adjustSize()
         overlay.move(left, area.y() + area.height() - overlay.height() - gap)
         self._fs_overlay = overlay
+        self._fs_bar_home = overlay.pos()
 
     def _dock_bar(self):
+        self._close_drawer()
+        self._fs_chevron = None
         if self._fs_overlay is None:
             return
         self._fs_overlay.layout().removeWidget(self.player.bar)
@@ -1755,6 +2056,157 @@ class MainWindow(QMainWindow):
         else:
             self.player.set_chrome_visible(visible)
 
+    # ------------------------------------------------- fullscreen drawer
+
+    @property
+    def drawer_open(self) -> bool:
+        return self._fs_drawer is not None and self._fs_drawer.isVisible()
+
+    def _bar_wheeled(self, delta: int):
+        """Wheel over the control bar: down opens the drawer, up closes it.
+
+        Only the bar and its chevron. Over the picture above the bar the
+        wheel is still the volume, and the bar's own volume slider still
+        takes its wheel before it ever reaches here.
+        """
+        self._bottom_zone_wheel(delta)
+
+    def _bottom_zone_wheel(self, delta: int):
+        """The wheel anywhere across the bottom of a fullscreen picture.
+
+        Closed: rolling down pulls the sheet up. Open: the wheel walks the
+        row of episodes (or films) - it never touches the volume down here -
+        and rolling up once the row is back at its start puts the sheet away.
+        """
+        if self.drawer_open:
+            self._fs_drawer.wheel(delta)
+        elif delta < 0:
+            self._open_drawer()
+
+    def _in_bottom_zone(self, global_pos) -> bool:
+        """The band the bar and the sheet live in: the bottom quarter."""
+        if not self._fs_state:
+            return False
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.geometry() if screen else self.geometry()
+        return global_pos.y() >= area.y() + int(area.height() * 0.72)
+
+    def _toggle_drawer(self):
+        if self.drawer_open:
+            self._close_drawer()
+        else:
+            self._open_drawer()
+
+    def _open_drawer(self, season=None):
+        if not self._fs_state or self._fs_overlay is None:
+            return
+        self._drawer_season = season
+        title, items, portrait, seasons, season = self._drawer_items(season)
+        if not items:
+            self._key_feedback("Nothing else to show here")
+            return
+        if self._fs_drawer is None:
+            self._fs_drawer = FullscreenDrawer(self.images)
+            self._fs_drawer.itemChosen.connect(self._drawer_chosen)
+            self._fs_drawer.seasonChosen.connect(self._open_drawer)
+            self._fs_drawer.closeRequested.connect(self._close_drawer)
+        self._fs_drawer.set_seasons(seasons, season)
+        screen = self.screen() or QApplication.primaryScreen()
+        # The *available* rectangle: a window manager keeps a stay-on-top tool
+        # window clear of its panel even over a fullscreen app, and would shove
+        # the sheet up after the bar had already been placed against it.
+        area = screen.availableGeometry() if screen else self.geometry()
+        self._fs_drawer.set_items(title, items, portrait)
+        self._fs_drawer.place(area)
+        self._fs_drawer.show()
+        # The bar rises to sit on the sheet rather than being buried under it -
+        # now, and again once the window manager has had its say.
+        self._settle_bar_on_drawer()
+        QTimer.singleShot(0, self._settle_bar_on_drawer)
+        if self._fs_chevron is not None:
+            self._fs_chevron.setText("⌃")
+        self._fs_idle_ms = 0
+        self._restore_cursor()
+
+    def _settle_bar_on_drawer(self):
+        overlay = self._fs_overlay
+        if overlay is None or not self.drawer_open:
+            return
+        top = self._fs_drawer.frameGeometry().top()
+        overlay.move(overlay.x(), top - overlay.height() - 8)
+        overlay.show()
+        overlay.raise_()
+
+    def _close_drawer(self):
+        if self._fs_drawer is not None:
+            self._fs_drawer.hide()
+        if self._fs_overlay is not None and getattr(self, "_fs_bar_home", None) is not None:
+            self._fs_overlay.move(self._fs_bar_home)
+        if self._fs_chevron is not None:
+            self._fs_chevron.setText("⌄")
+
+    def _drawer_chosen(self, payload):
+        self._close_drawer()
+        self._drawer_season = None
+        kind, item = payload
+        if kind == "episode":
+            self._play_episode(item)
+        else:
+            self.play_item(item, kind=kind)
+
+    def _drawer_items(self, season=None):
+        """What the sheet lists for whatever is playing.
+
+        An episode: one season of the show - the one playing unless a chip
+        picked another - current episode marked. A film: the other films in
+        its category, best rated first. A channel: its category's other
+        channels. Returns (title, items, portrait, seasons, season).
+        """
+        if self._current_episode is not None and self._episode_queue:
+            show = self._playing_series[1] if self._playing_series else ""
+            current_id = str(self._current_episode["episode_id"])
+            seasons = sorted({int(e.get("season") or 0) for e in self._episode_queue})
+            if season is None or season not in seasons:
+                season = int(self._current_episode.get("season") or 0)
+            items = []
+            for episode in self._episode_queue:
+                if int(episode.get("season") or 0) != season:
+                    continue
+                label, _ = episode_caption(episode, show)
+                items.append({
+                    "payload": ("episode", episode),
+                    "label": label,
+                    "image_url": episode.get("image_url") or "",
+                    "current": str(episode["episode_id"]) == current_id,
+                })
+            return (show or "Episodes", items, False, seasons, season)
+
+        row = self._current_item
+        kind = self._playing_kind
+        if row is None or not self.playlist or kind not in ("movie", "live"):
+            return ("", [], False, [], None)
+        stream_id = str(row[0])
+        category = self.db.scalar(
+            "SELECT category_id FROM streams WHERE playlist_id=? AND kind=? "
+            "AND stream_id=? LIMIT 1", (self.playlist.id, kind, stream_id))
+        if not category:
+            return ("", [], False, [], None)
+        order = "s.rating DESC, s.name_folded" if kind == "movie" else "s.num, s.name_folded"
+        rows = self.db.query(
+            "SELECT s.stream_id, s.name, s.icon, s.rating, s.container_extension, "
+            "s.num, s.available, s.epg_channel_id, s.added FROM streams s "
+            "WHERE s.playlist_id=? AND s.kind=? AND s.category_id=? "
+            "AND s.stream_id<>? AND s.available=1 AND s.name<>'' "
+            f"ORDER BY {order} LIMIT 60",
+            (self.playlist.id, kind, category, stream_id))
+        items = [{"payload": (kind, r), "label": r["name"], "image_url": r["icon"] or ""}
+                 for r in rows]
+        name = self.db.scalar(
+            "SELECT name FROM categories WHERE playlist_id=? AND kind=? AND category_id=?",
+            (self.playlist.id, kind, category)) or ""
+        title = f"More like this · {name}" if kind == "movie" else f"Channels · {name}"
+        return (title, items, kind == "movie", [], None)
+
     def exit_fullscreen(self):
         state = self._fs_state
         if not state:
@@ -1766,13 +2218,13 @@ class MainWindow(QMainWindow):
         self._restore_chrome(state)
 
         # Drop stay-on-top again, or the window stays pinned over other apps.
+        # Only Windows set a flag on the way in; restoring flags elsewhere would
+        # needlessly recreate the native window and black out the video on exit.
         self._set_native_chrome(False)
-        self.setWindowFlags(state["flags"])
+        if sys.platform.startswith("win"):
+            self.setWindowFlags(state["flags"])
         self.show()
-        self.showNormal()
-        self.restoreGeometry(state["geometry"])
-        if state["maximized"]:
-            self.showMaximized()
+        self._restore_window_state(state)
         self._splitter.setSizes(state["sizes"])
         self._fs_state = None
         self.activateWindow()
@@ -1780,13 +2232,45 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------ picture-in-picture
 
-    def _video_double_clicked(self):
-        """In PiP a double-click means "give me the window back", not "now go
-        fullscreen" — which is what it means everywhere else."""
+    def _video_clicked(self, x_fraction: float):
+        """A single click on the picture.
+
+        Windowed it plays/pauses. Fullscreen, the left and right thirds jump
+        ten seconds back and forward (YouTube's tap zones) and the middle
+        plays/pauses. Deferred by the double-click interval so that a
+        double-click is only ever fullscreen, never a pause plus fullscreen.
+        """
+        if not self.player.has_media:
+            return
+        self._click_x = x_fraction
+        self._click_timer.start()
+
+    def _single_click_settled(self):
+        if not self.player.has_media:
+            return
+        x_fraction = self._click_x
+        if self._fs_state and x_fraction < 1 / 3:
+            self._seek_feedback(-SEEK_STEP_SECONDS)
+        elif self._fs_state and x_fraction > 2 / 3:
+            self._seek_feedback(SEEK_STEP_SECONDS)
+        else:
+            self.player.toggle_pause()
+            self._key_feedback("Pause" if not self.player.is_playing() else "Play")
+
+    def _video_double_clicked(self, x_fraction: float = 0.5):
+        """Fullscreen on and off; in PiP it means "give me the window back"."""
+        self._click_timer.stop()          # the first click of the pair
         if self._pip_state:
             self.exit_pip()
         else:
             self.toggle_fullscreen()
+
+    def _seek_feedback(self, step: int) -> bool:
+        if self.player.seek_relative(step):
+            self._key_feedback(f"Seek {step:+d}s")
+            return True
+        self._key_feedback("Live stream — cannot seek")
+        return False
 
     def toggle_pip(self):
         if self._pip_state:
@@ -1828,9 +2312,11 @@ class MainWindow(QMainWindow):
         self._set_controls_visible(False)
         self._relayout()
 
-        if self.isMaximized():
+        if self.isMaximized() or self.isFullScreen():
+            self._state_hook_muted = True
             self.showNormal()
-        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self._state_hook_muted = False
+        self._set_stay_on_top(True)
         self.setGeometry(*rect)
         self.show()
         if int(self.player.surface.winId()) != state["handle"]:
@@ -1845,6 +2331,23 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.player.surface.setFocus(Qt.OtherFocusReason)
 
+    def _set_stay_on_top(self, on: bool):
+        """Pin (or unpin) the window without rebuilding it.
+
+        QWidget.setWindowFlag(s) reparents, which destroys and re-creates the
+        native window. The video surface keeps its handle through that, but
+        libVLC's video output does not survive the unmap underneath it: the
+        picture goes black and a later stop() can wait forever on the output
+        thread (measured: 2 in 3 attempts). The QWindow behind the widget
+        applies the same flag in place - _NET_WM_STATE_ABOVE on X11, a
+        topmost SetWindowPos on Windows - and nothing is torn down.
+        """
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.setFlag(Qt.WindowStaysOnTopHint, bool(on))
+        else:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(on))
+
     def exit_pip(self):
         state = self._pip_state
         if not state:
@@ -1857,11 +2360,9 @@ class MainWindow(QMainWindow):
         self.player.set_chrome_visible(True)
         self._restore_chrome(state)
 
-        self.setWindowFlags(state["flags"])
+        self._set_stay_on_top(False)
         self.show()
-        self.restoreGeometry(state["geometry"])
-        if state["maximized"]:
-            self.showMaximized()
+        self._restore_window_state(state)
         self._splitter.setSizes(state["sizes"])
         self.player.bar.set_pip(False)
         self.activateWindow()
@@ -1961,9 +2462,10 @@ class MainWindow(QMainWindow):
             return
 
         # Leave the bar up while the pointer is over it, or it vanishes under
-        # the cursor mid-drag of the seek slider.
-        if self._fs_overlay is not None and \
-                self._fs_overlay.geometry().contains(position):
+        # the cursor mid-drag of the seek slider. Same while the drawer is
+        # open: it is something being read, not chrome in the way.
+        if self.drawer_open or (self._fs_overlay is not None and
+                                self._fs_overlay.geometry().contains(position)):
             self._fs_idle_ms = 0
             return
 
@@ -1991,6 +2493,10 @@ class MainWindow(QMainWindow):
         """
         if event.type() == QEvent.KeyPress and self._handle_player_key(event):
             return True
+        if event.type() == QEvent.MouseMove and isinstance(obj, QWindow) and self._app_fullscreen:
+            # Every move reaches the window even when the widget under the
+            # pointer has no mouse tracking; the edge strips read this.
+            self._edge_pos = event.globalPosition().toPoint()
         if event.type() == QEvent.Wheel and self._handle_player_wheel(event, obj):
             return True
         return super().eventFilter(obj, event)
@@ -2032,23 +2538,67 @@ class MainWindow(QMainWindow):
         surface already covers fullscreen and Picture-in-Picture, since it is
         never reparented for either; it just grows to fill them.
 
-        Every event delivered here is claimed, whatever its direction,
-        including a stray horizontal one: the surface has nothing of its own
-        to do with a wheel event, and an unaccepted one is exactly the input
-        macOS reads as a swipe between full-screen Spaces (the same failure
-        already fixed for the scroll areas in BoundedScrollArea) - now doubly
-        likely here, since fullscreen video is the most natural place to keep
-        scrolling.
+        `VideoSurface.wheelEvent` handles the case where the event reaches the
+        widget directly. This filter is the other half: on X11/XWayland libVLC's
+        embedded child window is the real event target and Qt routes the wheel
+        to a bare QWindow, never to the QWidget - so an identity check on the
+        surface would miss it. Hit-test the pointer against the surface instead.
+
+        Every event handled here is claimed, whatever its direction, including a
+        stray horizontal one: the surface has nothing of its own to do with a
+        wheel event, and an unaccepted one is exactly the input macOS reads as a
+        swipe between full-screen Spaces (the same failure already fixed for the
+        scroll areas in BoundedScrollArea) - now doubly likely here, since
+        fullscreen video is the most natural place to keep scrolling.
         """
-        if obj is not self.player.surface or not self.player.available:
+        if not self.player.available:
             return False
+        if self._in_bottom_zone(event.globalPosition().toPoint()):
+            # Fullscreen's bottom band belongs to the sheet, not the volume.
+            delta = event.angleDelta().y()
+            if delta:
+                self._bottom_zone_wheel(delta)
+            event.accept()
+            return True
+        surface = self.player.surface
+        if obj is not surface:
+            # Only take over for the QWindow case; a real child widget with its
+            # own use for the wheel (a menu, a list) must keep it.
+            if not isinstance(obj, QWindow) or not surface.isVisible():
+                return False
+            local = surface.mapFromGlobal(event.globalPosition().toPoint())
+            if not surface.rect().contains(local):
+                return False
         delta = event.angleDelta().y()
         if delta:
-            step = VOLUME_STEP if delta > 0 else -VOLUME_STEP
-            self._key_feedback(f"Volume {self.player.bar.nudge_volume(step)}%")
-            self.db.set_setting("volume", str(self.player.bar.volume.value()))
+            self._apply_video_wheel(delta, bool(event.modifiers() & Qt.ShiftModifier))
         event.accept()
         return True
+
+    def _on_video_wheel(self, delta: int, modifiers: int):
+        """VideoSurface.wheelEvent, for the events Qt does deliver to the widget."""
+        if self._in_bottom_zone(QCursor.pos()):
+            self._bottom_zone_wheel(delta)
+            return
+        if delta and self.player.available:
+            self._apply_video_wheel(delta, bool(modifiers & Qt.ShiftModifier.value))
+
+    def _apply_video_wheel(self, delta: int, seek: bool):
+        """A wheel notch over the video: volume, or a seek while Shift is held.
+
+        Matches VLC, where the plain wheel is volume and the timeline is what
+        scrubs - Shift is the shortcut for reaching that without the bar.
+        """
+        if seek:
+            step = SEEK_STEP_SECONDS if delta > 0 else -SEEK_STEP_SECONDS
+            if self.player.seek_relative(step):
+                self._key_feedback(f"Seek {step:+d}s")
+            else:
+                self._key_feedback("Live stream — cannot seek")
+            return
+        step = VOLUME_STEP if delta > 0 else -VOLUME_STEP
+        self._key_feedback(f"Volume {self.player.bar.nudge_volume(step)}%")
+        self.db.set_setting("volume", str(self.player.bar.volume.value()))
 
     def _handle_player_key(self, event) -> bool:
         """Returns True when the key was consumed as a player command."""
@@ -2057,7 +2607,10 @@ class MainWindow(QMainWindow):
         key = event.key()
 
         if key == Qt.Key_Escape and self._fs_state:
-            self.exit_fullscreen()
+            if self.drawer_open:
+                self._close_drawer()
+            else:
+                self.exit_fullscreen()
             return True
         if key == Qt.Key_Escape and self._pip_state:
             self.exit_pip()
@@ -2070,6 +2623,12 @@ class MainWindow(QMainWindow):
             return True
         if key == Qt.Key_Escape and self.home_open:
             self.close_home()
+            return True
+        if key == Qt.Key_Escape and self._app_fullscreen:
+            self.exit_app_fullscreen()
+            return True
+        if key == Qt.Key_F11 and not self._fs_state and not self._pip_state:
+            self.toggle_app_fullscreen()
             return True
         # Dialogs (VLSub, Effects) keep their own keyboard entirely — but the
         # test is "does another window own the focus", not "is this window
@@ -2129,10 +2688,12 @@ class MainWindow(QMainWindow):
     def _key_feedback(self, message: str):
         """Say what the key did — otherwise there is no telling it worked.
 
-        Fullscreen and PiP hide the status bar, so the floating control bar is
-        popped back up instead: it already shows the position and volume the key
-        just changed, and fades out again on its own.
+        The VLC-style OSD over the video carries it in every mode; the status
+        bar still shows it too when the window has one, and in fullscreen / PiP
+        the floating control bar is popped back up as well so its slider and
+        clock catch up with the change.
         """
+        self._show_osd(message)
         if self._pip_state:
             self._pip_hold_ms = 1600
             self._set_controls_visible(True)
@@ -2143,11 +2704,61 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(message, 1500)
 
+    def _show_osd(self, text: str, msecs: int = 1300):
+        """A brief caption over the video, the way VLC shows volume and seeks.
+
+        Its own top-level, not a child widget: Qt cannot paint over libVLC's
+        native video window, but a separate window sits above it fine - the same
+        trick the fullscreen control bar uses. Positioned from the video
+        surface's current screen rectangle, so it lands in the right place
+        windowed, fullscreen and in Picture-in-Picture without special-casing.
+        """
+        surface = self.player.surface
+        if not surface.isVisible():
+            return
+        if self._osd is None:
+            osd = QLabel(None, Qt.Tool | Qt.FramelessWindowHint
+                         | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus)
+            osd.setObjectName("videoOsd")
+            osd.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            osd.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            osd.setAlignment(Qt.AlignCenter)
+            osd.setStyleSheet(
+                "#videoOsd { background: rgba(0,0,0,180); color: #fff;"
+                " border-radius: 6px; padding: 8px 16px;"
+                " font-size: 15px; font-weight: 600; }")
+            self._osd = osd
+        self._osd.setText(text)
+        self._osd.adjustSize()
+        top_left = surface.mapToGlobal(surface.rect().topLeft())
+        x = top_left.x() + (surface.width() - self._osd.width()) // 2
+        y = top_left.y() + int(surface.height() * 0.72)
+        self._osd.move(max(top_left.x() + 8, x), y)
+        self._osd.show()
+        self._osd.raise_()
+        self._osd_timer.start(msecs)
+
+    def _hide_osd(self):
+        self._osd_timer.stop()
+        if self._osd is not None:
+            self._osd.hide()
+
     # -------------------------------------------------------------- series
 
     def _build_home_page(self):
         self.home_page = HomePage(self.images)
+        self.home_page.meta_provider = self._continue_meta
+        self.home_page.cursorChanged.connect(self._hero_cursor)
+        # Details for the billboard are fetched once the cursor has rested
+        # on a title for a moment, not for every poster the arrows fly past.
+        self._hero_timer = QTimer(self)
+        self._hero_timer.setSingleShot(True)
+        self._hero_timer.setInterval(450)
+        self._hero_timer.timeout.connect(self._hero_fetch)
+        self._hero_target = None
         self.home_page.itemActivated.connect(self._activate_home)
+        self.home_page.favouriteToggled.connect(self.toggle_favourite_item)
+        self.home_page.menuRequested.connect(self._poster_menu)
         self.home_page.seeAllRequested.connect(self._see_all_rail)
         self.home_page.unpinRequested.connect(self._unpin_rail)
         self.home_page.moveRequested.connect(self.move_rail)
@@ -2203,6 +2814,138 @@ class MainWindow(QMainWindow):
     def close_home(self):
         self._show_middle(self.list_view)
         self._return_focus()
+
+    # ------------------------------------------------------- the billboard
+
+    def _hero_cursor(self, kind: str, row):
+        """The homepage cursor moved: show what is known, fetch what is not."""
+        self._hero_target = (kind, str(row[0]), row)
+        info, complete = self._hero_info(kind, row)
+        self.home_page.hero.set_content(info)
+        self._hero_timer.stop()
+        if not complete and self.playlist and self.playlist.is_xtream:
+            self._hero_timer.start()
+
+    def _hero_info(self, kind: str, row):
+        """(billboard dict, whether the provider has already been asked)."""
+        stream_id = str(row[0])
+        info = {"title": str(row[1]), "kind": kind, "poster": row[2] or "",
+                "art": "", "rating": row[3]}
+        if not self.playlist:
+            return info, True
+        if kind == "series":
+            detail = self._series_info(stream_id)
+            seasons = self.db.scalar(
+                "SELECT COUNT(DISTINCT season) FROM series_episodes "
+                "WHERE playlist_id=? AND series_id=?", (self.playlist.id, stream_id)) or 0
+            info.update({
+                "art": detail.get("backdrop") or "",
+                "plot": detail.get("plot") or "",
+                "genre": detail.get("genre") or "",
+                "release_date": detail.get("release_date") or "",
+                "rating": detail.get("rating") or row[3],
+                "seasons": seasons,
+                "hint": "Enter to open the show",
+            })
+            return info, bool(detail)
+        if kind == "movie":
+            detail = self.db.one(
+                "SELECT backdrop, plot, genre, release_date, rating, duration "
+                "FROM movie_info WHERE playlist_id=? AND stream_id=?",
+                (self.playlist.id, stream_id))
+            if detail is not None:
+                info.update({
+                    "art": detail["backdrop"] or "",
+                    "plot": detail["plot"] or "",
+                    "genre": detail["genre"] or "",
+                    "release_date": detail["release_date"] or "",
+                    "rating": detail["rating"] or row[3],
+                    "duration": detail["duration"] or "",
+                })
+            info["hint"] = "Enter to play"
+            return info, detail is not None
+        category = self.db.scalar(
+            "SELECT c.name FROM streams s JOIN categories c ON c.playlist_id=s.playlist_id "
+            "AND c.kind=s.kind AND c.category_id=s.category_id "
+            "WHERE s.playlist_id=? AND s.kind=? AND s.stream_id=? LIMIT 1",
+            (self.playlist.id, kind, stream_id))
+        info.update({"genre": category or "", "hint": "Enter to watch"})
+        return info, True
+
+    def _hero_fetch(self):
+        target = self._hero_target
+        if target is None or not self.playlist:
+            return
+        kind, stream_id, _row = target
+        db_path, playlist = self.db.path, self.playlist
+
+        def job():
+            from core import sync as sync_mod
+
+            db = Database(db_path)
+            try:
+                if kind == "series":
+                    sync_mod.fetch_episodes(db, playlist, stream_id)
+                else:
+                    sync_mod.fetch_movie_info(db, playlist, stream_id)
+            finally:
+                db.close()
+            return True
+
+        ThreadedTask.run(self, (kind, stream_id), job, self._hero_fetched)
+
+    def _hero_fetched(self, token, result):
+        target = self._hero_target
+        if not result or target is None or (target[0], target[1]) != token:
+            return          # the cursor has moved on, or the provider said no
+        info, _ = self._hero_info(target[0], target[2])
+        self.home_page.hero.set_content(info)
+
+    def _continue_meta(self, kind: str, row) -> dict:
+        """What the Continue Watching card says about one title.
+
+        Progress from the last history record; for a show, the episode that
+        record points at (its label, its title, and its still for the big
+        card - the provider's series poster is portrait, the episode stills
+        are not).
+        """
+        from ui.continue_rail import minutes_left
+
+        if not self.playlist:
+            return {}
+        record = self.db.one(
+            "SELECT episode_id, position_secs, duration_secs FROM history "
+            "WHERE playlist_id=? AND kind=? AND stream_id=? "
+            "ORDER BY watched_at DESC LIMIT 1",
+            (self.playlist.id, kind, str(row[0])))
+        if record is None:
+            return {}
+        duration = int(record["duration_secs"] or 0)
+        position = int(record["position_secs"] or 0)
+        meta = {
+            "fraction": min(1.0, position / duration) if duration > 0 else 0.0,
+            "left": minutes_left(position, duration),
+            "caption": "",
+            "still": "",
+        }
+        if kind == "series" and record["episode_id"]:
+            episode = self.db.one(
+                "SELECT season, episode_num, title, image FROM series_episodes "
+                "WHERE playlist_id=? AND series_id=? AND episode_id=?",
+                (self.playlist.id, str(row[0]), str(record["episode_id"])))
+            if episode is not None:
+                label, _ = episode_caption({
+                    "season": episode["season"], "episode": episode["episode_num"],
+                    "title": episode["title"] or ""}, str(row[1]))
+                # "S03E04 · Old Friends" -> "S3 E4 • Old Friends"
+                code, _, name = label.partition(" · ")
+                season, _, number = code[1:].partition("E")
+                meta["caption"] = (f"S{int(season)} E{int(number)}"
+                                   + (f"  •  {name}" if name else ""))
+                meta["still"] = episode["image"] or ""
+        elif kind == "movie":
+            meta["caption"] = str(row[1])
+        return meta
 
     def _activate_home(self, kind: str, row):
         """Play from the wall without being thrown off it.
@@ -2296,6 +3039,8 @@ class MainWindow(QMainWindow):
         self.search_page = SearchPage(self.images)
         self.search_page.backRequested.connect(self.close_search)
         self.search_page.resultActivated.connect(self._activate_result)
+        self.search_page.favouriteToggled.connect(self.toggle_favourite_item)
+        self.search_page.menuRequested.connect(self._poster_menu)
         self.search_page.seeAllRequested.connect(self._see_all)
         self.search_page.searchRequested.connect(self._schedule_master_search)
         self.stack.addWidget(self.search_page)
@@ -2505,7 +3250,9 @@ class MainWindow(QMainWindow):
         # longer throws you back to the grid of every show you own.
         self._idle_timer.stop()
         self.set_player_visible(True)
-        self.player.play(url, title, is_live=False, resume_secs=int(resume_secs or 0))
+        self._play_original_url = url
+        self.player.play(self._cached_url(url, episode["ext"], False), title,
+                         is_live=False, resume_secs=int(resume_secs or 0))
 
     def _episode_menu(self, episode, position):
         menu = QMenu(self)
@@ -2628,6 +3375,21 @@ class MainWindow(QMainWindow):
         if resolved:
             self._resolved[url] = (time.time(), resolved)
 
+    def _cached_url(self, url: str, ext: str, is_live: bool) -> str:
+        """Route a VOD stream through the play-through disk cache.
+
+        Playback still starts at once - the proxy serves bytes as they land -
+        but the whole file accumulates on disk, so a dropped connection is
+        patched invisibly and replays cost nothing. Live has no end to cache.
+        """
+        if is_live or not self.db.get_bool("cache_streams", True):
+            return url
+        try:
+            return self.stream_cache.open(url, ext)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Stream cache unavailable: {exc}", 6000)
+            return url
+
     def _playable_url(self, url: str) -> str:
         """Use a freshly resolved CDN URL when we have one."""
         hit = self._resolved.get(url)
@@ -2639,28 +3401,64 @@ class MainWindow(QMainWindow):
 
     def toggle_favourite(self, index):
         row = index.data(ROLE_ITEM)
+        if row is not None:
+            self.toggle_favourite_item(index.data(ROLE_KIND) or self.kind, row)
+
+    def toggle_favourite_item(self, kind: str, row):
+        """The heart on any poster, wherever it was drawn."""
         if row is None or not self.playlist:
             return
         stream_id = str(row[0])
-        if self.model.is_favourite(stream_id):
+        if (kind, stream_id) in self._favourite_keys:
             self.db.execute(
                 "DELETE FROM favourites WHERE playlist_id=? AND kind=? AND stream_id=?",
-                (self.playlist.id, self.kind, stream_id),
+                (self.playlist.id, kind, stream_id),
             )
+            self.statusBar().showMessage(f"Removed from favourites: {row[1]}", 3000)
         else:
             self.db.execute(
                 "INSERT OR REPLACE INTO favourites(playlist_id, kind, stream_id, added_at)"
                 " VALUES(?,?,?,?)",
-                (self.playlist.id, self.kind, stream_id, int(time.time())),
+                (self.playlist.id, kind, stream_id, int(time.time())),
             )
-        favourites = {
-            r["stream_id"] for r in self.db.query(
-                "SELECT stream_id FROM favourites WHERE playlist_id=? AND kind=?",
-                (self.playlist.id, self.kind),
-            )
-        }
-        self.model.set_favourites(favourites)
+            self.statusBar().showMessage(f"Added to favourites: {row[1]}", 3000)
+        self._load_favourite_keys()
+        if kind == self.kind:
+            self.model.set_favourites({sid for k, sid in self._favourite_keys if k == kind})
         self.invalidate_counts()
+        # Everything showing a heart repaints; the home wall is rebuilt on
+        # its next visit, so its Favourites row catches up then.
+        self.list_view.viewport().update()
+        if getattr(self, "home_page", None) is not None:
+            self.home_page.repaint_rails()
+        if getattr(self, "search_page", None) is not None:
+            for section in self.search_page.findChildren(QWidget, "resultSection"):
+                if hasattr(section, "repaint"):
+                    section.repaint()
+
+    def _poster_menu(self, kind: str, row, position):
+        """Right-click on a poster anywhere outside the catalog grid."""
+        if row is None:
+            return
+        menu = QMenu(self)
+        if kind == "series":
+            menu.addAction("Open show", lambda: self.open_series(row))
+        else:
+            menu.addAction("Play", lambda: self.play_item(row, kind=kind))
+        favourite = (kind, str(row[0])) in self._favourite_keys
+        menu.addAction("♥  Remove from favourites" if favourite else "♡  Add to favourites",
+                       lambda: self.toggle_favourite_item(kind, row))
+        menu.exec(position)
+
+    def _load_favourite_keys(self):
+        if not self.playlist:
+            self._favourite_keys = set()
+            return
+        self._favourite_keys = {
+            (r["kind"], str(r["stream_id"])) for r in self.db.query(
+                "SELECT kind, stream_id FROM favourites WHERE playlist_id=?",
+                (self.playlist.id,))
+        }
 
     def _item_menu(self, point):
         index = self.list_view.indexAt(point)
@@ -2720,6 +3518,21 @@ class MainWindow(QMainWindow):
             self.playlist.id, row[0], row[1], url, minutes * 60, ext="ts"
         )
         self.statusBar().showMessage(f"Recording {row[1]} for {minutes} min", 6000)
+
+    def choose_cache_size(self):
+        from PySide6.QtWidgets import QInputDialog
+
+        current = self.db.get_int("stream_cache_limit_gb", DEFAULT_LIMIT_GB)
+        value, ok = QInputDialog.getInt(
+            self, "Stream cache size", "Keep at most this many GB of cached streams:",
+            current, 1, 500)
+        if ok:
+            self.db.set_setting("stream_cache_limit_gb", str(value))
+            self.stream_cache.limit_bytes = value * 1024 ** 3
+
+    def clear_stream_cache(self):
+        freed = self.stream_cache.clear()
+        self.statusBar().showMessage(f"Stream cache cleared ({freed // 1024 ** 2} MB freed)", 6000)
 
     def open_subtitles(self):
         title = self.now_title.text() or ""
@@ -2790,6 +3603,22 @@ class MainWindow(QMainWindow):
             self.store.update(self.playlist.id, auto_sync=1 if enabled else 0)
             self.playlist = self.store.get(self.playlist.id)
 
+    def _set_keychain_credentials(self, use_keychain: bool):
+        from ui.subtitle_dialog import SECRET_PASSWORD, SECRET_USER
+
+        self.db.set_setting("credential_store", "keyring" if use_keychain else "local")
+        ids = [p.id for p in self.store.all()]
+        playlists_mod.switch_store(
+            self.db, to_local=not use_keychain,
+            playlist_ids=ids, secret_names=(SECRET_USER, SECRET_PASSWORD))
+        where = ("the system keychain" if use_keychain
+                 else "this app's database (obfuscated, not encrypted)")
+        QMessageBox.information(
+            self, "Password storage",
+            f"Passwords are now kept in {where}.\n\n"
+            "Anything that couldn't be moved across just now — a locked "
+            "keychain, say — will need re-entering in Playlists ▸ edit.")
+
     def show_about(self):
         QMessageBox.about(
             self, "About IPTV Player",
@@ -2809,6 +3638,15 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
+        self._edge_timer.stop()
+        if self._edges is not None:
+            self._edges.close()
+            self._edges = None
+        self._osd_timer.stop()
+        if self._osd is not None:
+            self._osd.close()
+            self._osd.deleteLater()
+            self._osd = None
         if self._fs_state:
             self.exit_fullscreen()
         if self._pip_state:
@@ -2828,6 +3666,10 @@ class MainWindow(QMainWindow):
             pass
         try:
             self.downloads.shutdown()
+        except Exception:
+            pass
+        try:
+            self.stream_cache.shutdown()
         except Exception:
             pass
         if self._sync_thread and self._sync_thread.isRunning():

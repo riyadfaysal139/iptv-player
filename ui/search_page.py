@@ -84,6 +84,8 @@ class ResultSection(QWidget):
     """One kind's matches, rendered by the catalog's own delegate."""
 
     activated = Signal(str, object)      # kind, row
+    favouriteToggled = Signal(str, object)   # kind, row
+    menuRequested = Signal(str, object, object)   # kind, row, global position
     seeAllRequested = Signal(str)        # kind
 
     def __init__(self, kind: str, title: str, images, parent=None):
@@ -127,15 +129,33 @@ class ResultSection(QWidget):
             self.view.setViewMode(QListView.IconMode)
             self.view.setResizeMode(QListView.Adjust)
             self.view.setSpacing(4)
-            self.view.setItemDelegate(PosterDelegate(images, lambda: self.model, self))
+            delegate = PosterDelegate(images, lambda: self.model, self)
+            delegate.favouriteToggled.connect(self._heart_clicked)
+            self.view.setItemDelegate(delegate)
         self.view.clicked.connect(self._clicked)
         self.view.doubleClicked.connect(self._clicked)
+        self.view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._context_menu)
         box.addWidget(self.view)
 
     def _clicked(self, index):
         row = index.data(ROLE_ITEM)
         if row is not None:
             self.activated.emit(self.kind, row)
+
+    def _heart_clicked(self, index):
+        row = index.data(ROLE_ITEM)
+        if row is not None:
+            self.favouriteToggled.emit(self.kind, row)
+
+    def _context_menu(self, point):
+        index = self.view.indexAt(point)
+        row = index.data(ROLE_ITEM) if index.isValid() else None
+        if row is not None:
+            self.menuRequested.emit(self.kind, row, self.view.viewport().mapToGlobal(point))
+
+    def repaint(self):
+        self.view.viewport().update()
 
     def set_results(self, rows, truncated: bool):
         self.model.set_rows(rows, self.kind, set())
@@ -170,6 +190,8 @@ class SearchPage(QWidget):
 
     backRequested = Signal()
     resultActivated = Signal(str, object)     # kind, row
+    favouriteToggled = Signal(str, object)    # kind, row
+    menuRequested = Signal(str, object, object)   # kind, row, global position
     seeAllRequested = Signal(str, str)        # kind, term
     searchRequested = Signal(str)             # term, after the debounce
 
@@ -229,6 +251,8 @@ class SearchPage(QWidget):
         for kind, title in SECTION_TITLES:
             section = ResultSection(kind, title, self.images)
             section.activated.connect(self.resultActivated)
+            section.favouriteToggled.connect(self.favouriteToggled)
+            section.menuRequested.connect(self.menuRequested)
             section.seeAllRequested.connect(
                 lambda k: self.seeAllRequested.emit(k, self.term()))
             section.hide()

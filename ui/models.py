@@ -15,7 +15,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractListModel, QModelIndex, QObject, QRect, QRunnable, QSize, Qt,
+    QAbstractListModel, QEvent, QModelIndex, QObject, QRect, QRunnable, QSize, Qt,
     QThreadPool, Signal,
 )
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
@@ -263,7 +263,17 @@ class CatalogModel(QAbstractListModel):
             return self._rows[row]
         return None
 
-    def is_favourite(self, stream_id: str) -> bool:
+    # One lookup for every model: (kind, stream_id) -> bool, installed by the
+    # window, which owns the favourites table. Mixed rails (the homepage) and
+    # the search page have no per-kind set of their own, so without this
+    # their hearts could never light up.
+    favourite_lookup = None
+
+    def is_favourite(self, stream_id: str, row: int | None = None) -> bool:
+        lookup = CatalogModel.favourite_lookup
+        if lookup is not None:
+            kind = self.kind_at(row) if row is not None else self._kind
+            return bool(lookup(kind, str(stream_id)))
         return stream_id in self._favourites
 
     def set_favourites(self, favourites: set[str]):
@@ -339,7 +349,7 @@ class ChannelDelegate(QStyledItemDelegate):
 
         # favourite heart
         model = self._model()
-        is_fav = model.is_favourite(row[0]) if model else False
+        is_fav = model.is_favourite(row[0], index.row()) if model else False
         painter.setPen(QPen(QColor("#f5d90a") if is_fav else QColor("#414c85")))
         painter.drawText(
             QRect(rect.right() - 34, rect.top(), 26, rect.height()),
@@ -352,13 +362,59 @@ class ChannelDelegate(QStyledItemDelegate):
         return QRect(option_rect.right() - 34, option_rect.top(), 26, option_rect.height())
 
 
+HEART = 24              # the favourite button's diameter, top-right of the art
+
+
 class PosterDelegate(QStyledItemDelegate):
-    """Poster grid for movies and series, with a rating badge."""
+    """Poster grid for movies and series, with a rating badge.
+
+    The heart in the poster's top-right corner is a button: it shows on
+    hover and on the cursor's poster, stays lit once the title is a
+    favourite, and a click on it toggles that without selecting or playing.
+    """
+
+    favouriteToggled = Signal(object)       # the index whose heart was clicked
 
     def __init__(self, images: ImageCache, model_getter, parent=None):
         super().__init__(parent)
         self.images = images
         self._model = model_getter
+
+    @classmethod
+    def heart_rect(cls, option_rect: QRect) -> QRect:
+        art = cls.art_rect(option_rect)
+        return QRect(art.right() - HEART - 5, art.top() + 5, HEART, HEART)
+
+    def hit_rect(self, option_rect: QRect, option=None, index=None) -> QRect:
+        """Where a click counts as the heart. Subclasses that scale the cell
+        override this so the hit area follows the drawing."""
+        return self.heart_rect(option_rect)
+
+    def editorEvent(self, event, model, option, index) -> bool:
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
+                            QEvent.MouseButtonDblClick) \
+                and event.button() == Qt.LeftButton \
+                and self.hit_rect(option.rect, option, index).contains(event.position().toPoint()):
+            if event.type() == QEvent.MouseButtonRelease:
+                self.favouriteToggled.emit(index)
+            return True         # swallowed: not a selection, not a play
+        return super().editorEvent(event, model, option, index)
+
+    def _paint_heart(self, painter: QPainter, option, row, index):
+        model = self._model()
+        favourite = bool(model and model.is_favourite(row[0], index.row()))
+        showing = favourite or bool(option.state & (QStyle.State_MouseOver | QStyle.State_Selected))
+        if not showing:
+            return
+        rect = self.heart_rect(option.rect)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.drawEllipse(rect)
+        font = QFont(painter.font())
+        font.setPointSizeF(11)
+        painter.setFont(font)
+        painter.setPen(QPen(QColor("#f5d90a") if favourite else QColor("#ffffff")))
+        painter.drawText(rect.adjusted(0, -1, 0, 0), Qt.AlignCenter, "♥" if favourite else "♡")
 
     def sizeHint(self, option, index) -> QSize:
         return QSize(POSTER_W + 14, POSTER_H + 40)
@@ -421,12 +477,7 @@ class PosterDelegate(QStyledItemDelegate):
                 painter.setFont(font)
                 painter.drawText(badge, Qt.AlignCenter, f"{value:.1f}")
 
-        # favourite marker
-        model = self._model()
-        if model and model.is_favourite(row[0]):
-            painter.setPen(QPen(QColor("#f5d90a")))
-            painter.drawText(QRect(art.right() - 24, art.top() + 2, 20, 20),
-                             Qt.AlignCenter, "♥")
+        self._paint_heart(painter, option, row, index)
 
         # title
         painter.setFont(QFont())

@@ -26,7 +26,14 @@ from ui import icons
 from ui.gridnav import move_cursor, rows_from_geometry
 from ui.scrollarea import BoundedScrollArea
 
-POSTER_WIDTH = 260
+POSTER_WIDTH = 160
+# Longer synopses are folded to this many characters until clicked: the point
+# of the page is the episodes, and they should start above the fold.
+PLOT_FOLD_CHARS = 170
+# Below this viewport width the poster no longer fits beside the text (as when
+# the player is docked next to the page); it goes above it instead, smaller.
+STACK_BELOW = 640
+POSTER_WIDTH_NARROW = 150
 CARD_WIDTH = 268
 CARD_IMAGE_HEIGHT = 150
 WATCHED_FRACTION = 0.95     # past this an episode counts as finished, not resumable
@@ -228,14 +235,17 @@ class MetaRow(QWidget):
         self.value = QLabel("")
         self.value.setObjectName("metaValue")
         self.value.setWordWrap(True)
-        self.value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.value.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        self.value.setOpenExternalLinks(False)
         self.value.setAlignment(Qt.AlignTop | Qt.AlignLeft)
 
         row.addWidget(badge)
         row.addWidget(colon)
         row.addWidget(self.value, 1)
 
-    def set_text(self, text: str):
+    def set_text(self, text: str, rich: bool = False):
+        # Explicit, so a synopsis containing "<" is never parsed as markup.
+        self.value.setTextFormat(Qt.RichText if rich else Qt.PlainText)
         self.value.setText(text or "")
 
 
@@ -388,8 +398,8 @@ class SeriesPage(QWidget):
         self.scroll = scroll
 
         root = QVBoxLayout(body)
-        root.setContentsMargins(28, 24, 28, 28)
-        root.setSpacing(18)
+        root.setContentsMargins(28, 10, 28, 28)
+        root.setSpacing(10)
 
         # header ---------------------------------------------------------
         header = QHBoxLayout()
@@ -404,13 +414,17 @@ class SeriesPage(QWidget):
         self.back_button.clicked.connect(self.backRequested)
         self.title_label = QLabel("")
         self.title_label.setObjectName("seriesTitle")
-        header.addWidget(self.back_button)
+        # A long title must wrap in a narrow pane, not force a sideways scroll.
+        self.title_label.setWordWrap(True)
+        header.addWidget(self.back_button, 0, Qt.AlignTop)
         header.addWidget(self.title_label, 1)
         root.addLayout(header)
 
         # poster + metadata ----------------------------------------------
         top = QHBoxLayout()
-        top.setSpacing(26)
+        top.setSpacing(20)
+        self.top = top
+        self._stacked = False
         self.poster = QLabel()
         self.poster.setObjectName("seriesPoster")
         self.poster.setFixedWidth(POSTER_WIDTH)
@@ -418,7 +432,7 @@ class SeriesPage(QWidget):
         top.addWidget(self.poster, 0, Qt.AlignTop)
 
         meta = QVBoxLayout()
-        meta.setSpacing(9)
+        meta.setSpacing(5)
         self.rows = {}
         for key, glyph in (("director", "director"), ("release", "calendar"),
                            ("genre", "genre"), ("cast", "cast"),
@@ -426,6 +440,9 @@ class SeriesPage(QWidget):
             row = MetaRow(glyph)
             self.rows[key] = row
             meta.addWidget(row)
+        self.rows["plot"].value.linkActivated.connect(self._toggle_plot)
+        self._plot = ""
+        self._plot_open = False
 
         self.continue_button = QPushButton("")
         self.continue_button.setObjectName("continueButton")
@@ -513,9 +530,57 @@ class SeriesPage(QWidget):
         pixmap = self.images.get(self._cover_url) if self._cover_url else None
         if pixmap is not None and not pixmap.isNull():
             self.poster.setPixmap(pixmap.scaledToWidth(
-                POSTER_WIDTH, Qt.SmoothTransformation))
+                self._poster_width(), Qt.SmoothTransformation))
         else:
             self.poster.setText("")
+
+    def _show_plot(self):
+        """The synopsis, folded past PLOT_FOLD_CHARS until clicked open."""
+        import html
+
+        row = self.rows["plot"]
+        text = self._plot
+        if not self._plot_open and len(text) > PLOT_FOLD_CHARS:
+            cut = text.rfind(" ", 0, PLOT_FOLD_CHARS)
+            text = text[:cut if cut > 0 else PLOT_FOLD_CHARS].rstrip(" ,.;:") + "…"
+            row.set_text(f'{html.escape(text)} <a href="more" style="color:#f5d90a">more</a>', rich=True)
+        elif self._plot_open and len(self._plot) > PLOT_FOLD_CHARS:
+            row.set_text(f'{html.escape(text)} <a href="less" style="color:#f5d90a">less</a>', rich=True)
+        else:
+            row.set_text(text)
+
+    def _toggle_plot(self, _link):
+        self._plot_open = not self._plot_open
+        self._show_plot()
+
+    # ------------------------------------------------------------- reflow
+
+    def _poster_width(self) -> int:
+        return POSTER_WIDTH_NARROW if self._stacked else POSTER_WIDTH
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow(self.scroll.viewport().width())
+
+    def _reflow(self, width: int):
+        """Poster beside the text when there is room, above it when not.
+
+        The page shares the window with the docked player, and the pane it
+        is left with can be half the width the reference layout assumes.
+        Rather than clip the metadata behind a sideways scrollbar, the top
+        block turns into a column: everything stays readable at any width.
+        """
+        stacked = width < STACK_BELOW
+        if stacked == self._stacked:
+            return
+        self._stacked = stacked
+        from PySide6.QtWidgets import QBoxLayout
+
+        self.top.setDirection(QBoxLayout.TopToBottom if stacked else QBoxLayout.LeftToRight)
+        self.top.setSpacing(14 if stacked else 20)
+        self.top.setAlignment(self.poster, Qt.AlignTop | Qt.AlignLeft)
+        self.poster.setFixedWidth(self._poster_width())
+        self._apply_poster()
 
     # ---------------------------------------------------------------- data
 
@@ -548,7 +613,9 @@ class SeriesPage(QWidget):
         self.rows["cast"].set_text(info.get("cast_list") or "")
         self.rows["rating"].set_text(
             "" if rating in (None, "") else f"{float(rating):g}")
-        self.rows["plot"].set_text(info.get("plot") or "")
+        self._plot = info.get("plot") or ""
+        self._plot_open = False
+        self._show_plot()
 
         episode, resume = pick_resume(self._episodes, self._history)
         if episode is not None:

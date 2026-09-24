@@ -3,10 +3,20 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# libVLC (3.x) embeds video by an X11 window id via MediaPlayer.set_xwindow().
+# A native Wayland Qt client has no X11 id, so winId() hands libVLC a handle it
+# cannot use: it opens its own top-level window instead of painting into our
+# surface, fullscreen then covers an empty pane, and the bad handle can crash
+# the xcb vout. Run through XWayland so winId() is a real XID. setdefault keeps
+# an explicit QT_QPA_PLATFORM (or a future real-Wayland embedding path) working.
+if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QGuiApplication  # noqa: E402
@@ -89,6 +99,7 @@ def _run_selftest(importlib) -> int:
         "ui.category_tree", "ui.downloads_panel", "ui.effects_dialog",
         "ui.icons", "ui.main_window", "ui.models", "ui.player_widget",
         "ui.playlist_dialog", "ui.subtitle_dialog", "ui.transport_bar",
+        "ui.onscreen_keyboard",
     ]
     failures = []
     for name in modules:
@@ -214,6 +225,10 @@ def main() -> int:
 
     window = MainWindow(db)
     window.show()
+    if db.get_bool("start_fullscreen", True):
+        # A media app owns the screen: launch the way a TV app does. Esc or
+        # F11 brings the normal window (and its title bar) back.
+        window.enter_app_fullscreen()
     return app.exec()
 
 

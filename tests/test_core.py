@@ -8,6 +8,7 @@ wrong group, the totals stop matching.
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -166,6 +167,7 @@ class TestDatabase(unittest.TestCase):
 
         pl_mod.keyring = _FakeKeyring
         pl_mod._KEYRING_OK = True
+        pl_mod.use_local_store(None)          # keychain path; also clears the cache
 
         self.tmp = tempfile.TemporaryDirectory()
         self.db = Database(Path(self.tmp.name) / "t.sqlite")
@@ -175,6 +177,7 @@ class TestDatabase(unittest.TestCase):
 
         pl_mod.keyring = self._real_keyring
         pl_mod._KEYRING_OK = self._real_ok
+        pl_mod.use_local_store(None)
         self.db.close()
         self.tmp.cleanup()
 
@@ -211,6 +214,58 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(store.get(playlist.id).password, secret)
         client = store.get(playlist.id).client()
         self.assertIn(f"/{secret}/", client.movie_url("123", "mp4"))
+
+    def test_local_store_keeps_credentials_out_of_the_keychain(self):
+        from core import playlists as pl_mod
+
+        pl_mod.use_local_store(self.db)
+        try:
+            store = PlaylistStore(self.db)
+            playlist = store.add("A", TYPE_XTREAM, "http://a", "user", "sésame-42")
+            self.assertEqual(store.get(playlist.id).password, "sésame-42")
+            self.assertEqual(self._fake_store, {}, "nothing went to the keychain")
+            # stored, but not as plaintext
+            row = self.db.one("SELECT value FROM secrets LIMIT 1")
+            self.assertIsNotNone(row)
+            self.assertNotIn("sésame", row["value"])
+        finally:
+            pl_mod.use_local_store(None)
+
+    def test_password_reads_are_cached(self):
+        from core import playlists as pl_mod
+
+        store = PlaylistStore(self.db)
+        playlist = store.add("A", TYPE_XTREAM, "http://a", "user", "secret")
+        store.get(playlist.id).password                       # populates the cache
+        self._fake_store.clear()                              # yank the backing store
+        self.assertEqual(store.get(playlist.id).password, "secret",
+                         "a second read comes from the cache, not the keychain")
+
+    def test_switch_store_carries_credentials_to_the_local_db(self):
+        from core import playlists as pl_mod
+
+        store = PlaylistStore(self.db)
+        one = store.add("A", TYPE_XTREAM, "http://a", "user", "pw-a")
+        two = store.add("B", TYPE_XTREAM, "http://b", "user", "pw-b")
+        pl_mod.set_secret("opensubtitles-password", "sub-pw", self.db.instance_id)
+
+        pl_mod.switch_store(self.db, to_local=True,
+                            playlist_ids=[one.id, two.id],
+                            secret_names=("opensubtitles-password",))
+
+        self.assertTrue(pl_mod.local_store_active())
+        self.assertEqual(store.get(one.id).password, "pw-a")
+        self.assertEqual(store.get(two.id).password, "pw-b")
+        self.assertEqual(
+            pl_mod.get_secret("opensubtitles-password", self.db.instance_id), "sub-pw")
+        # and nothing new landed in the keychain during the move
+        self.assertEqual(self._fake_store, {(pl_mod.KEYRING_SERVICE,
+                         pl_mod._key(one.id, self.db.instance_id)): "pw-a",
+                         (pl_mod.KEYRING_SERVICE,
+                          pl_mod._key(two.id, self.db.instance_id)): "pw-b",
+                         (pl_mod.KEYRING_SERVICE,
+                          f"{self.db.instance_id}-opensubtitles-password"): "sub-pw"},
+                         "originals stay in the keychain; switch_store does not wipe them")
 
     def test_fold_strips_accents(self):
         self.assertEqual(fold("Ünïcodé"), "unicode")
@@ -1756,6 +1811,122 @@ class TestRailListView(unittest.TestCase):
         self.assertFalse(self.wheel(240).isAccepted())
 
 
+class TestSeekSliderWheel(unittest.TestCase):
+    """A wheel over the timeline must seek, the way it does in VLC.
+
+    QSlider's own wheelEvent nudges the value but never emits
+    sliderPressed/sliderReleased, which is the only path the transport bar
+    turns into an actual seek - so without this the wheel looked dead over the
+    scrub bar.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QWheelEvent
+
+        from ui.transport_bar import SeekSlider, WHEEL_SEEK_SECONDS
+
+        self.Qt = Qt
+        self.QPoint, self.QPointF, self.QWheelEvent = QPoint, QPointF, QWheelEvent
+        self.step = WHEEL_SEEK_SECONDS
+        self.slider = SeekSlider()
+        self.slider.setEnabled(True)
+        self.seen = []
+        self.slider.seekRequested.connect(self.seen.append)
+
+    def wheel(self, delta_y: int):
+        event = self.QWheelEvent(
+            self.QPointF(10, 5), self.QPointF(10, 5),
+            self.QPoint(0, 0), self.QPoint(0, delta_y),
+            self.Qt.NoButton, self.Qt.NoModifier, self.Qt.NoScrollPhase, False,
+        )
+        self.slider.wheelEvent(event)
+        return event
+
+    def test_one_notch_up_seeks_forward(self):
+        self.assertTrue(self.wheel(120).isAccepted())
+        self.assertEqual(self.seen, [self.step])
+
+    def test_one_notch_down_seeks_back(self):
+        self.wheel(-120)
+        self.assertEqual(self.seen, [-self.step])
+
+    def test_a_disabled_slider_ignores_the_wheel(self):
+        self.slider.setEnabled(False)
+        event = self.wheel(120)
+        self.assertFalse(event.isAccepted())
+        self.assertEqual(self.seen, [])
+
+
+class TestVideoSurfaceWheel(unittest.TestCase):
+    """A wheel over the video reports itself, so MainWindow can act on it.
+
+    On X11/XWayland libVLC's embedded child window is the real event target and
+    Qt never routes the wheel to this widget - MainWindow's app-level filter is
+    the other half - but where Qt does deliver it here, it must not be dropped.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from PySide6.QtCore import QPoint, QPointF, Qt
+        from PySide6.QtGui import QWheelEvent
+
+        from ui.player_widget import VideoSurface
+
+        self.Qt = Qt
+        self.QPoint, self.QPointF, self.QWheelEvent = QPoint, QPointF, QWheelEvent
+        self.surface = VideoSurface()
+        self.seen = []
+        self.surface.wheelScrolled.connect(lambda d, m: self.seen.append((d, m)))
+
+    def wheel(self, delta_y: int, modifier=None):
+        modifier = modifier if modifier is not None else self.Qt.NoModifier
+        event = self.QWheelEvent(
+            self.QPointF(10, 10), self.QPointF(10, 10),
+            self.QPoint(0, 0), self.QPoint(0, delta_y),
+            self.Qt.NoButton, modifier, self.Qt.NoScrollPhase, False,
+        )
+        self.surface.wheelEvent(event)
+        return event
+
+    def test_a_vertical_wheel_is_reported_and_claimed(self):
+        self.assertTrue(self.wheel(120).isAccepted())
+        self.assertEqual(self.seen, [(120, 0)])
+
+    def test_the_shift_modifier_is_passed_through(self):
+        self.wheel(-120, self.Qt.ShiftModifier)
+        self.assertEqual(len(self.seen), 1)
+        delta, mods = self.seen[0]
+        self.assertEqual(delta, -120)
+        self.assertTrue(mods & self.Qt.ShiftModifier.value)
+
+
+class TestVolumeRange(unittest.TestCase):
+    """The volume slider goes to 200%, matching VLC's own ceiling."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_slider_ceiling_is_200(self):
+        from ui.transport_bar import VolumeSlider
+
+        self.assertEqual(VolumeSlider().maximum(), 200)
+
+
 class TestHomeOrder(unittest.TestCase):
     """Moving a homepage row up or down, and remembering where it went."""
 
@@ -2086,6 +2257,474 @@ class TestEpisodeGrid(unittest.TestCase):
     def test_moving_along_a_row_stops_at_its_end(self):
         rows = self.rows(self.grid(5, 13))
         self.assertEqual(self.move(rows, (2, 2), 0, 1), (2, 2))
+
+
+class TestSubtitleTrackMatch(unittest.TestCase):
+    """The subtitle chosen on one episode is found again on the next by name."""
+
+    def setUp(self):
+        from ui.player_widget import match_track
+
+        self.match = match_track
+
+    def test_exact_name_wins(self):
+        tracks = [(3, "English"), (4, "English [SDH]"), (5, "Spanish")]
+        self.assertEqual(self.match("English", tracks), 3)
+
+    def test_loose_match_when_labels_drift(self):
+        self.assertEqual(self.match("English", [(7, "Track 1 - [English]")]), 7)
+        self.assertEqual(self.match("English [SDH]", [(7, "English")]), 7)
+
+    def test_no_track_means_none(self):
+        self.assertIsNone(self.match("French", [(3, "English")]))
+        self.assertIsNone(self.match("", [(3, "English")]))
+
+
+class TestEnglishDefault(unittest.TestCase):
+    """With nothing chosen yet, an English track is picked on its own."""
+
+    def setUp(self):
+        from ui.player_widget import english_track
+
+        self.english = english_track
+
+    def test_any_of_the_usual_labels(self):
+        for label in ("English", "eng", "en", "Track 2 - [eng]", "EN (SRT)"):
+            self.assertEqual(self.english([(1, "Spanish"), (2, label)]), 2, label)
+
+    def test_whole_words_only(self):
+        self.assertIsNone(self.english([(1, "French"), (2, "Dutch")]))
+
+    def test_plain_english_beats_forced_and_sdh(self):
+        tracks = [(1, "English [Forced]"), (2, "English (SDH)"), (3, "English")]
+        self.assertEqual(self.english(tracks), 3)
+        # ...but a variant is still better than nothing.
+        self.assertEqual(self.english(tracks[:2]), 1)
+
+
+class TestEarlyEnd(unittest.TestCase):
+    """A stream that dies mid-episode is reconnected, not skipped.
+
+    Exercised on a bare PlayerWidget instance (no Qt init, no libVLC) by
+    driving the bookkeeping fields the poll tick would otherwise fill in.
+    """
+
+    def _widget(self):
+        from ui.player_widget import PlayerWidget
+
+        w = PlayerWidget.__new__(PlayerWidget)
+        w._is_live = False
+        w._seekable = True
+        w._last_duration = 2400
+        w._drop_retries = 0
+        w._drop_at = -1
+        return w
+
+    def test_stopping_far_from_the_end_is_a_drop(self):
+        w = self._widget()
+        w._last_position = 900
+        self.assertTrue(w.ended_early())
+
+    def test_the_last_seconds_are_a_real_finish(self):
+        w = self._widget()
+        w._last_position = 2390
+        self.assertFalse(w.ended_early())
+
+    def test_live_and_unknown_length_never_count(self):
+        w = self._widget()
+        w._last_position = 900
+        w._is_live = True
+        self.assertFalse(w.ended_early())
+        w._is_live = False
+        w._last_duration = 0
+        self.assertFalse(w.ended_early())
+
+    def test_retries_run_out_at_the_same_spot(self):
+        from ui.player_widget import EARLY_END_RETRIES
+
+        w = self._widget()
+        w._last_position = 900
+        for _ in range(EARLY_END_RETRIES):
+            self.assertTrue(w.ended_early())
+            w._drop_retries += 1
+            w._drop_at = w._last_position
+        self.assertFalse(w.ended_early())
+        # ...but progress past the trouble spot earns a fresh budget.
+        w._last_position = 1500
+        self.assertTrue(w.ended_early())
+
+
+class TestStreamCacheIntervals(unittest.TestCase):
+    def test_merge_and_lookup(self):
+        from core.streamcache import available_end, merge_intervals, next_gap
+
+        runs = merge_intervals([[10, 20], [0, 5], [20, 30], [40, 50]])
+        self.assertEqual(runs, [[0, 5], [10, 30], [40, 50]])
+        self.assertEqual(available_end(runs, 12), 30)
+        self.assertIsNone(available_end(runs, 5))
+        self.assertEqual(next_gap(runs, 0, 60), 5)
+        self.assertEqual(next_gap(runs, 12, 60), 30)
+        self.assertIsNone(next_gap([[0, 60]], 0, 60))
+
+
+class TestStreamCacheProxy(unittest.TestCase):
+    """The play-through cache against a local 'provider' that drops mid-file.
+
+    The upstream serves a random file with Range support and kills the
+    connection once, part way through; the proxy must hand a client the whole
+    file regardless, and file all of it on disk, over one upstream connection
+    at a time.
+    """
+
+    SIZE = 3 * 1024 * 1024
+
+    def setUp(self):
+        import os
+        import tempfile
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.data = os.urandom(self.SIZE)
+        state = {"drops_left": 1, "open": 0, "max_open": 0, "requests": []}
+        data = self.data
+        lock = threading.Lock()
+
+        class Upstream(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                import re
+                m = re.match(r"bytes=(\d+)-", self.headers.get("Range") or "")
+                start = int(m.group(1)) if m else 0
+                with lock:
+                    state["open"] += 1
+                    state["max_open"] = max(state["max_open"], state["open"])
+                    state["requests"].append(start)
+                try:
+                    body = data[start:]
+                    self.send_response(206 if m else 200)
+                    self.send_header("Content-Length", str(len(body)))
+                    if m:
+                        self.send_header("Content-Range", f"bytes {start}-{len(data)-1}/{len(data)}")
+                    self.end_headers()
+                    sent = 0
+                    while sent < len(body):
+                        if state["drops_left"] and sent >= 1024 * 1024:
+                            state["drops_left"] -= 1
+                            import socket
+                            self.connection.shutdown(socket.SHUT_RDWR)   # the hiccup
+                            return
+                        chunk = body[sent:sent + 65536]
+                        self.wfile.write(chunk)
+                        sent += len(chunk)
+                except OSError:
+                    pass
+                finally:
+                    with lock:
+                        state["open"] -= 1
+
+        self.state = state
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        self.upstream.daemon_threads = True
+        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.upstream.server_address[1]}/movie.mp4"
+        self.tmp = tempfile.TemporaryDirectory()
+
+        from core.streamcache import StreamCache
+        self.cache = StreamCache(Path(self.tmp.name), limit_bytes=10 ** 9)
+
+    def tearDown(self):
+        self.cache.shutdown()
+        self.upstream.shutdown()
+        self.upstream.server_close()
+        self.tmp.cleanup()
+
+    def _get(self, url, headers=None):
+        from urllib.request import Request, urlopen
+        with urlopen(Request(url, headers=headers or {}), timeout=60) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+
+    def test_whole_file_arrives_despite_a_drop(self):
+        local = self.cache.open(self.url, "mp4")
+        # What libVLC does with an MP4: peek at the tail for the index first.
+        status, headers, tail = self._get(local, {"Range": f"bytes={self.SIZE - 4096}-"})
+        self.assertEqual(status, 206)
+        self.assertEqual(tail, self.data[-4096:])
+        status, headers, body = self._get(local)
+        self.assertEqual(status, 200)
+        self.assertEqual(int(headers["Content-Length"]), self.SIZE)
+        self.assertEqual(body, self.data)
+        self.assertEqual(self.state["drops_left"], 0, "the drop never happened")
+        self.assertEqual(self.state["max_open"], 1, "two upstream connections at once")
+        # Everything filed: a second play needs no provider at all.
+        stream = self.cache.current
+        for _ in range(100):
+            if stream.complete:
+                break
+            time.sleep(0.05)
+        self.assertTrue(stream.complete)
+        self.assertEqual(stream.path.read_bytes(), self.data)
+
+    def test_partial_cache_resumes_from_disk(self):
+        local = self.cache.open(self.url, "mp4")
+        self._get(local, {"Range": "bytes=0-65535"})
+        self.cache.release()                    # playback stopped part way
+        before = len(self.state["requests"])
+        # Same URL again: the head comes off disk, only the rest is fetched.
+        local = self.cache.open(self.url, "mp4")
+        status, _, body = self._get(local)
+        self.assertEqual(body, self.data)
+        self.assertTrue(all(start > 0 for start in self.state["requests"][before:]),
+                        self.state["requests"])
+
+    def test_trim_keeps_within_the_limit(self):
+        import os
+        self.cache.limit_bytes = 2 * 1024
+        for name in ("aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"):
+            (Path(self.tmp.name) / f"{name}.mp4").write_bytes(os.urandom(1500))
+            time.sleep(0.02)
+        self.cache._trim()
+        left = sorted(p.name for p in Path(self.tmp.name).iterdir())
+        self.assertEqual(left, ["bbbbbbbbbbbbbbbb.mp4"])
+
+
+class TestHomeWallText(unittest.TestCase):
+    def test_headings_soften_but_keep_initials(self):
+        from ui.home_page import pretty_heading
+
+        self.assertEqual(pretty_heading("CONTINUE WATCHING"), "Continue Watching")
+        self.assertEqual(pretty_heading("SHOWS · DOCUMENTARY"), "Shows · Documentary")
+        self.assertEqual(pretty_heading("LIVE · UK NEWS"), "Live · UK News")
+
+    def test_billboard_facts_line(self):
+        from ui.hero_panel import facts_line, fold_plot
+
+        self.assertEqual(facts_line({"rating": 8, "release_date": "2020-03-05",
+                                     "genre": "Comedy / Drama", "seasons": 4}),
+                         "★ 8.0   2020   Comedy / Drama   4 seasons")
+        self.assertEqual(facts_line({"rating": "n/a", "seasons": 1}), "1 season")
+        self.assertEqual(facts_line({"kind": "live"}), "Live TV")
+        self.assertTrue(fold_plot("word " * 100).endswith("…"))
+        self.assertEqual(fold_plot("short"), "short")
+
+    def test_time_left(self):
+        from ui.continue_rail import minutes_left
+
+        self.assertEqual(minutes_left(600, 1800), "20m left")
+        self.assertEqual(minutes_left(120, 7200), "1h 58m left")
+        self.assertEqual(minutes_left(1790, 1800), "Almost done")
+        self.assertEqual(minutes_left(0, 0), "")
+
+
+class TestOnScreenKeyboard(unittest.TestCase):
+    """The floating keyboard: which fields bring it out, and what it types.
+
+    Real widgets, offscreen: a synthetic key event that a QLineEdit does not
+    turn into text is exactly the regression this guards against.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _keyboard_for(self, field):
+        from ui.onscreen_keyboard import OnScreenKeyboard
+
+        keyboard = OnScreenKeyboard()
+        keyboard.set_target(field)
+        return keyboard
+
+    def _key(self, keyboard, what):
+        return next(k for k in keyboard._keys if k.what == what)
+
+    def test_text_entry_widgets(self):
+        from PySide6.QtWidgets import (
+            QComboBox, QLabel, QLineEdit, QListView, QPlainTextEdit,
+            QPushButton, QSpinBox, QTextEdit,
+        )
+
+        from ui.onscreen_keyboard import is_text_entry
+
+        for widget in (QLineEdit(), QTextEdit(), QPlainTextEdit(), QSpinBox()):
+            with self.subTest(widget=type(widget).__name__):
+                self.assertTrue(is_text_entry(widget))
+        editable = QComboBox()
+        editable.setEditable(True)
+        self.assertTrue(is_text_entry(editable))
+
+        # Nothing to type into: the keyboard would only cover the content.
+        for widget in (None, QLabel(), QPushButton(), QListView(), QComboBox()):
+            with self.subTest(widget=type(widget).__name__):
+                self.assertFalse(is_text_entry(widget))
+        locked = QLineEdit()
+        locked.setReadOnly(True)
+        self.assertFalse(is_text_entry(locked))
+
+    def test_types_into_the_field(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QLineEdit
+
+        from ui.onscreen_keyboard import SHIFT, SYMBOLS, LETTERS
+
+        field = QLineEdit()
+        keyboard = self._keyboard_for(field)
+        for what in ("h", "i"):
+            self._key(keyboard, what).click()
+        self.assertEqual(field.text(), "hi")
+
+        # Shift is one-shot: one capital, then lower case again.
+        self._key(keyboard, SHIFT).click()
+        self.assertEqual(self._key(keyboard, "a").text(), "A")
+        self._key(keyboard, "a").click()
+        self._key(keyboard, "a").click()
+        self.assertEqual(field.text(), "hiAa")
+        self.assertEqual(self._key(keyboard, "a").text(), "a")
+
+        self._key(keyboard, " ").click()
+        self._key(keyboard, Qt.Key_Backspace).click()
+        self._key(keyboard, Qt.Key_Left).click()
+        self._key(keyboard, "x").click()
+        self.assertEqual(field.text(), "hiAxa")
+
+        # The symbol layer types what it shows, including non-ASCII keys.
+        self._key(keyboard, SYMBOLS).click()
+        self._key(keyboard, "@").click()
+        self._key(keyboard, "€").click()
+        self.assertEqual(field.text(), "hiAx@€a")
+        self._key(keyboard, LETTERS).click()
+        self.assertIsNotNone(self._key(keyboard, "q"))
+
+        # Enter is the field's return, the way a physical keyboard's is.
+        submitted = []
+        field.returnPressed.connect(lambda: submitted.append(field.text()))
+        self._key(keyboard, Qt.Key_Return).click()
+        self.assertEqual(submitted, ["hiAx@€a"])
+
+    def test_follows_focus_and_respects_dismissal(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QLineEdit, QPushButton, QWidget
+
+        from ui.onscreen_keyboard import CLOSE, KeyboardController
+
+        controller = KeyboardController(self.app)
+        host = QWidget()
+        field, other, button = QLineEdit(host), QLineEdit(host), QPushButton(host)
+
+        controller._focus_changed(None, field)
+        keyboard = controller.keyboard
+        self.assertIsNotNone(keyboard)
+        self.assertTrue(keyboard.isVisible())
+        self.assertIs(keyboard.parentWidget(), host)
+
+        controller._focus_changed(field, None)          # a window closing
+        self.assertTrue(keyboard.isVisible())
+        controller._focus_changed(None, button)
+        self.assertFalse(keyboard.isVisible())
+
+        # Another app in front: the keyboard goes with ours, and returns.
+        controller._focus_changed(button, field)
+        host.show()
+        self.app.setActiveWindow(host)
+        field.setFocus()
+        self.assertIs(self.app.focusWidget(), field)
+        controller._app_state_changed(Qt.ApplicationInactive)
+        self.assertFalse(keyboard.isVisible())
+        controller._app_state_changed(Qt.ApplicationActive)
+        self.assertTrue(keyboard.isVisible())
+
+        # ✕ hides it for this field; the next field brings it back.
+        controller._focus_changed(button, field)
+        self.assertTrue(keyboard.isVisible())
+        field.setFocus()
+        self._key(keyboard, CLOSE).click()
+        self.assertFalse(keyboard.isVisible())
+        controller._focus_changed(field, other)
+        self.assertTrue(keyboard.isVisible())
+
+    def test_geometry_round_trips_through_settings(self):
+        from PySide6.QtCore import QRect
+
+        from ui.onscreen_keyboard import KeyboardController, SETTING_KEY
+
+        store = {}
+        db = type("Db", (), {"get_setting": lambda self, k, d=None: store.get(k, d),
+                             "set_setting": lambda self, k, v: store.__setitem__(k, str(v))})()
+        controller = KeyboardController(self.app, db)
+        controller._remember(QRect(30, 40, 700, 260))
+        controller._flush()
+        self.assertEqual(store[SETTING_KEY], "30,40,700,260")
+        self.assertEqual(controller._saved_geometry(), QRect(30, 40, 700, 260))
+
+        store[SETTING_KEY] = "garbage"
+        self.assertIsNone(controller._saved_geometry())
+        store[SETTING_KEY] = "0,0,10,10"       # below the minimum: ignored
+        self.assertIsNone(controller._saved_geometry())
+
+
+class TestFloatingKeyboard(unittest.TestCase):
+    """The system-wide keyboard: the US keymap and what reaches the device."""
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_us_keymap(self):
+        from PySide6.QtCore import Qt
+
+        from core.uinput import CHARS, SPECIALS, typeable
+
+        self.assertEqual(CHARS["a"], (30, False))
+        self.assertEqual(CHARS["A"], (30, True))
+        self.assertEqual(CHARS["1"], (2, False))
+        self.assertEqual(CHARS["!"], (2, True))
+        self.assertEqual(CHARS["?"], (53, True))
+        self.assertEqual(CHARS["/"], (53, False))
+        self.assertEqual(SPECIALS[Qt.Key_Return], 28)
+        self.assertFalse(typeable("€"))
+        self.assertFalse(typeable("ab"))
+
+    def test_every_drawn_key_can_be_typed(self):
+        from keyboard import SYSTEM_SYMBOL_ROWS
+        from core.uinput import typeable
+        from ui.onscreen_keyboard import CLOSE, LETTERS, LETTER_ROWS, SHIFT, SYMBOLS
+
+        for rows in (LETTER_ROWS, SYSTEM_SYMBOL_ROWS):
+            for row in rows:
+                for label, what, _span in row:
+                    if what in (CLOSE, LETTERS, SHIFT, SYMBOLS):
+                        continue
+                    with self.subTest(key=label):
+                        self.assertTrue(typeable(what))
+
+    def test_delivers_to_the_device(self):
+        from PySide6.QtCore import Qt
+
+        from keyboard import SystemKeyboard
+        from ui.onscreen_keyboard import SHIFT, SYMBOLS
+
+        sent = []
+        device = type("Device", (), {
+            "type_char": lambda self, c: sent.append(c) or True,
+            "press_special": lambda self, k: sent.append(k) or True,
+        })()
+        keyboard = SystemKeyboard(device)
+        key = lambda what: next(k for k in keyboard._keys if k.what == what)  # noqa: E731
+        key("h").click()
+        key(SHIFT).click()
+        key("i").click()
+        key(Qt.Key_Backspace).click()
+        key(Qt.Key_Return).click()
+        key(SYMBOLS).click()
+        key(Qt.Key_Home).click()
+        key("@").click()
+        self.assertEqual(sent, ["h", "I", Qt.Key_Backspace, Qt.Key_Return, Qt.Key_Home, "@"])
 
 
 if __name__ == "__main__":
