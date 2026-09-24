@@ -7,6 +7,8 @@ wrong group, the totals stop matching.
 
 from __future__ import annotations
 
+import ast
+import re
 import sys
 import time
 import unittest
@@ -2729,3 +2731,91 @@ class TestFloatingKeyboard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestPackagingManifest(unittest.TestCase):
+    """The frozen build's manifest against what --selftest demands of it.
+
+    A module the app imports only through a string, or only from a script that
+    is not the app's entry point, is invisible to PyInstaller's static
+    analysis: it is simply left out, and the first sign is a ModuleNotFoundError
+    from a build nobody can reproduce locally. That is how ui.onscreen_keyboard
+    got shipped missing. Everything --selftest insists on must therefore either
+    be reachable by a real import or be named in the spec's hiddenimports.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def selftest_modules(self) -> list[str]:
+        source = (self.ROOT / "main.py").read_text()
+        block = source[source.index("modules = ["):]
+        block = block[: block.index("]")]
+        return re.findall(r'"([\w.]+)"', block)
+
+    def hidden_imports(self) -> set[str]:
+        """Only what is inside a hiddenimports list — not every quoted name.
+
+        Reading the whole spec would count the module named in the comment
+        that explains why it is listed, and the test would pass with the
+        listing deleted. It did, until this was fixed.
+        """
+        spec = (self.ROOT / "packaging" / "iptvplayer.spec").read_text()
+        found: set[str] = set()
+        for block in re.findall(r"hiddenimports\s*\+?=\s*\[([^\]]*)\]", spec, re.S):
+            found.update(re.findall(r'"([\w.]+)"', block))
+        return found
+
+    def app_imports(self) -> set[str]:
+        """Every module the app's own files import, relative ones resolved.
+
+        Parsed rather than grepped: `from . import m3u` and `from .core import
+        x` are ordinary imports that no pattern for "import core.m3u" will
+        ever see, and a test that misses them fails on modules that are fine.
+        """
+        skip_files = {"keyboard.py"}      # the stand-alone tool is not the app
+        found: set[str] = set()
+
+        for path in self.ROOT.rglob("*.py"):
+            parts = path.relative_to(self.ROOT).parts
+            if any(part.startswith((".", "test")) for part in parts):
+                continue
+            if path.name in skip_files:
+                continue
+            try:
+                tree = ast.parse(path.read_text(errors="ignore"))
+            except SyntaxError:
+                continue
+
+            package = ".".join(parts[:-1])
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    found.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom):
+                    base = node.module or ""
+                    if node.level:                       # a relative import
+                        base = f"{package}.{base}".rstrip(".") if base else package
+                    if base:
+                        found.add(base)
+                    found.update(
+                        f"{base}.{alias.name}" if base else alias.name
+                        for alias in node.names
+                    )
+        return found
+
+    def test_every_selftest_module_exists(self):
+        for module in self.selftest_modules():
+            path = self.ROOT.joinpath(*module.split(".")).with_suffix(".py")
+            self.assertTrue(path.exists(), f"{module} is checked by --selftest but has no file")
+
+    def test_every_selftest_module_will_be_frozen(self):
+        hidden = self.hidden_imports()
+        imported = self.app_imports()
+        for module in self.selftest_modules():
+            if module in imported:
+                continue
+            self.assertIn(
+                module, hidden,
+                f"{module} is checked by --selftest, is imported by nothing the app "
+                f"pulls in, and is not in the spec's hiddenimports - the frozen build "
+                f"will not contain it",
+            )

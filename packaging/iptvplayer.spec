@@ -39,6 +39,12 @@ hiddenimports = collect_submodules("keyring.backends")
 # VLSub's endpoint is XML-RPC. The module is only imported inside functions, so
 # it is spelled out here rather than trusted to static analysis.
 hiddenimports += ["xmlrpc.client", "gzip"]
+
+# The on-screen keyboard is imported by keyboard.py, the stand-alone desktop
+# tool, not by the app's own modules - so nothing static points at it and
+# PyInstaller drops it. It has to ship anyway: --selftest checks for it, and
+# the app is meant to be able to put it on screen.
+hiddenimports += ["ui.onscreen_keyboard"]
 if IS_MAC:
     hiddenimports += ["keyring.backends.macOS"]
 elif IS_WIN:
