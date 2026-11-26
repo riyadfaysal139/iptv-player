@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
+import shutil
 import struct
 import sys
 from pathlib import Path
@@ -287,4 +288,24 @@ def vlc_app_binary() -> Path | None:
             binary = Path(directory) / "vlc"
             if binary.exists():
                 return binary
+    return None
+
+
+def mpv_app_binary() -> Path | None:
+    """Path to the mpv application, for the 'Open in mpv' button.
+
+    mpv tone-maps HDR to an SDR display, which libVLC 3.x does not.
+    """
+    found = shutil.which("mpv")
+    if found:
+        return Path(found)
+    if sys.platform == "darwin":
+        candidates = ("/opt/homebrew/bin/mpv", "/usr/local/bin/mpv")
+    elif os.name == "nt":
+        candidates = (r"C:\Program Files\mpv\mpv.exe", r"C:\Program Files (x86)\mpv\mpv.exe")
+    else:
+        candidates = ("/usr/bin/mpv", "/usr/local/bin/mpv", "/snap/bin/mpv")
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return Path(candidate)
     return None

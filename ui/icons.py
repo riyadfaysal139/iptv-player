@@ -19,10 +19,10 @@ from PySide6.QtGui import (
     QBrush, QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap,
 )
 
-FG = "#d7dcf0"
-ACCENT = "#f5d90a"
-DIM = "#4d5480"
-RECORD = "#e0424f"
+FG = "#e5e5e5"
+ACCENT = "#e50914"
+DIM = "#666666"
+RECORD = "#e50914"
 
 _CACHE: dict = {}
 

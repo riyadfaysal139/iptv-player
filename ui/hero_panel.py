@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 HERO_HEIGHT = 224
 TEXT_WIDTH_FRACTION = 0.46
 PLOT_FOLD_CHARS = 190
-PAGE_COLOUR = "#070b22"
+PAGE_COLOUR = "#141414"
 
 
 def fold_plot(text: str, limit: int = PLOT_FOLD_CHARS) -> str:
@@ -163,9 +163,9 @@ class HeroPanel(QWidget):
             # the bottom, where the rails begin.
             fade = QLinearGradient(art_rect.left(), 0, art_rect.left() + art_rect.width() * 0.55, 0)
             fade.setColorAt(0.0, QColor(PAGE_COLOUR))
-            fade.setColorAt(1.0, QColor(7, 11, 34, 0))
+            fade.setColorAt(1.0, QColor(20, 20, 20, 0))
             painter.fillRect(art_rect, fade)
             bottom = QLinearGradient(0, rect.height() - 70, 0, rect.height())
-            bottom.setColorAt(0.0, QColor(7, 11, 34, 0))
+            bottom.setColorAt(0.0, QColor(20, 20, 20, 0))
             bottom.setColorAt(1.0, QColor(PAGE_COLOUR))
             painter.fillRect(QRect(0, rect.height() - 70, rect.width(), 70), bottom)

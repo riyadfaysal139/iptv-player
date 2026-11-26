@@ -24,8 +24,8 @@ from ui.models import HEART, ROLE_ITEM, ROLE_KIND, CatalogModel, POSTER_H, POSTE
 # above the rails is where the big picture lives now.
 HERO_W, HERO_H = 352, POSTER_H
 CARD_GAP = 16
-FOCUS_GROW = 1.06                   # the cursor's card, a little bigger
-HALO = 14                           # room for that growth around every card
+FOCUS_GROW = 1.0                    # the cursor's card is wide instead of scaled
+HALO = 8                            # room for that growth around every card
 RADIUS = 6
 PROGRESS_H = 5
 PROGRESS_COLOUR = "#e50914"
@@ -95,9 +95,10 @@ class _Strip(QWidget):
         """Where card `column` sits, at rest (before any growth)."""
         x = HALO
         bottom = HALO + HERO_H
+        wide = self.rail.cursor_column if self.rail.cursor_column is not None else 0
         for index in range(column + 1):
-            width = HERO_W if index == 0 else POSTER_W
-            height = HERO_H if index == 0 else POSTER_H
+            width = HERO_W if index == wide else POSTER_W
+            height = HERO_H if index == wide else POSTER_H
             if index == column:
                 return QRect(x, bottom - height, width, height)
             x += width + CARD_GAP
@@ -144,12 +145,13 @@ class _Strip(QWidget):
             painter.translate(-centre)
 
         painter.setClipPath(_rounded(rect))
-        painter.fillRect(rect, QColor("#101426"))
-        pixmap = self.rail.pixmap_for(column, landscape=(column == 0))
+        painter.fillRect(rect, QColor("#181818"))
+        wide = column == (self.rail.cursor_column if self.rail.cursor_column is not None else 0)
+        pixmap = self.rail.pixmap_for(column, landscape=wide)
         if pixmap is not None and not pixmap.isNull():
             self._draw_cover(painter, rect, pixmap)
 
-        if column == 0:
+        if wide:
             # The title sits on a fade at the foot of the still, TV-style.
             fade = QLinearGradient(rect.left(), rect.bottom() - 70, rect.left(), rect.bottom())
             fade.setColorAt(0.0, QColor(0, 0, 0, 0))
@@ -187,7 +189,7 @@ class _Strip(QWidget):
             font.setPointSizeF(11)
             font.setBold(False)
             painter.setFont(font)
-            painter.setPen(QColor("#f5d90a") if favourite else QColor("#ffffff"))
+            painter.setPen(QColor("#e50914") if favourite else QColor("#ffffff"))
             painter.drawText(heart.adjusted(0, -1, 0, 0), Qt.AlignCenter, "♥" if favourite else "♡")
         painter.restore()
 
@@ -265,6 +267,14 @@ class _StripScroll(QScrollArea):
         rect = strip.card_rect(index.row()).adjusted(-HALO, 0, HALO, 0)
         self.ensureVisible(rect.left(), 0, 0, 0)
         self.ensureVisible(rect.right(), 0, 0, 0)
+
+    def visualRect(self, index: QModelIndex):
+        """Where a card sits in the viewport, like a list view's visualRect."""
+        strip = self.widget()
+        if strip is None or not index.isValid():
+            return QRect()
+        rect = strip.card_rect(index.row()).adjusted(-HALO, 0, HALO, 0)
+        return rect.translated(-self.horizontalScrollBar().value(), 0)
 
     def wheelEvent(self, event):
         event.ignore()
@@ -397,6 +407,7 @@ class ContinueRail(QWidget):
             self.cursor_column = None
         else:
             self.cursor_column = int(column)
+        self.strip.resize(self.strip.sizeHint())
         self.strip.update()
         self._show_caption()
         return self.model.index(self.cursor_column, 0) if self.cursor_column is not None else None

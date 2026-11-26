@@ -526,7 +526,7 @@ declared, so Bengali and Arabic subtitles render instead of turning to mojibake.
 
 Also available: **Load local file…** (`.srt`, `.ass`, `.sub`, `.vtt`) with a
 delay control, the SUBS menu on the control bar for tracks the stream already
-carries, and **Open in VLC**, which hands the stream to the full VLC
+carries, and **Open in VLC** or **Open in mpv** (better for HDR files), which hand the stream to the full VLC
 application.
 
 > **On the REST API:** OpenSubtitles' newer REST API, which does require a key,

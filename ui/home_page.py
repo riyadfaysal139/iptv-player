@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QModelIndex, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPen
+from PySide6.QtCore import (QEasingCurve, QModelIndex, QPoint, QPropertyAnimation, QRect, QSize, Qt,
+                            QTimer, Signal)
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView, QFrame, QHBoxLayout, QLabel, QListView, QPushButton,
     QScrollArea, QStyle, QStyleOptionViewItem, QVBoxLayout, QWidget,
@@ -25,7 +26,7 @@ from ui.gridnav import move_cursor
 from ui.models import (
     POSTER_H, POSTER_W, ROLE_ITEM, ROLE_KIND, CatalogModel, PosterDelegate,
 )
-from ui.continue_rail import ContinueRail
+from ui.continue_rail import HERO_W, ContinueRail
 from ui.hero_panel import HeroPanel
 from ui.scrollarea import BoundedScrollArea
 
@@ -47,9 +48,9 @@ LOAD_MARGIN = 700       # pixels from the bottom at which the next page is asked
 # space every cell reserves. GROW_X/GROW_Y are sized so the scaled paint still
 # lands inside the cell's own rectangle: anything spilling past it would be
 # overdrawn by the next poster and clipped away by a partial repaint.
-FOCUS_SCALE = 1.18
-GROW_X, GROW_Y = 14, 22
-CURSOR_COLOUR = "#f5d90a"
+FOCUS_SCALE = 1.0
+GROW_X, GROW_Y = 6, 8
+CURSOR_COLOUR = "#ffffff"
 PAGE_RAILS = 3          # how far PageUp/PageDown jump
 FAR_END = 10 ** 6       # Home/End, expressed as a move the clamp absorbs
 
@@ -520,7 +521,11 @@ class RailDelegate(PosterDelegate):
 
     def sizeHint(self, option, index) -> QSize:
         hint = super().sizeHint(option, index)
-        return QSize(hint.width() + 2 * GROW_X, hint.height() + 2 * GROW_Y)
+        width = hint.width()
+        view = getattr(self.parent(), "view", None)
+        if view is not None and view.currentIndex() == index:
+            width = HERO_W + 14                 # the cursor's card: wide, at a fixed size
+        return QSize(width + 2 * GROW_X, hint.height() + 2 * GROW_Y)
 
     def hit_rect(self, option_rect: QRect, option=None, index=None) -> QRect:
         """The heart as drawn: the cursor's poster is painted scaled about
@@ -550,18 +555,39 @@ class RailDelegate(PosterDelegate):
             # Exactly the cell it would have had before the halo existed.
             super().paint(painter, inner, index)
             return
+        self._paint_wide(painter, inner, index)
 
-        centre = option.rect.center()
+    def _paint_wide(self, painter, option, index):
+        """The cursor's card: landscape, a blurred copy of the poster behind it."""
+        row = index.data(ROLE_ITEM)
+        art = self.art_rect(option.rect)
         painter.save()
-        painter.translate(centre)
-        painter.scale(FOCUS_SCALE, FOCUS_SCALE)
-        painter.translate(-centre)
-        super().paint(painter, inner, index)
-        # Drawn inside the scaled transform, so it frames the poster the parent
-        # just drew whatever the scale is.
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.fillRect(option.rect, QColor("#2a2a2a"))
+        pixmap = self.images.get(row[2]) if row[2] else None
+        painter.setClipRect(art)
+        if pixmap and not pixmap.isNull():
+            tiny = pixmap.scaled(16, 9, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            painter.drawPixmap(art, tiny.scaled(art.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+            painter.fillRect(art, QColor(0, 0, 0, 90))
+            sharp = pixmap.scaledToHeight(art.height(), Qt.SmoothTransformation)
+            painter.drawPixmap(art.left() + (art.width() - sharp.width()) // 2, art.top(), sharp)
+        else:
+            painter.fillRect(art, QColor("#181818"))
+            painter.setPen(QPen(QColor("#808080")))
+            painter.drawText(art, Qt.AlignCenter | Qt.TextWordWrap, row[1][:40])
+        painter.setClipping(False)
         painter.setPen(QPen(QColor(CURSOR_COLOUR), 2))
         painter.setBrush(Qt.NoBrush)
-        painter.drawRect(self.art_rect(inner.rect).adjusted(0, 0, -1, -1))
+        painter.drawRect(art.adjusted(0, 0, -1, -1))
+        self._paint_heart(painter, option, row, index)
+        cell = option.rect.adjusted(5, 5, -5, -5)
+        painter.setFont(QFont())
+        painter.setPen(QPen(QColor("#ffffff")))
+        title = QRect(cell.left(), art.bottom() + 4, cell.width(), 32)
+        text = painter.fontMetrics().elidedText(row[1], Qt.ElideRight, title.width() * 2)
+        painter.drawText(title, Qt.AlignTop | Qt.AlignHCenter | Qt.TextWordWrap, text)
         painter.restore()
 
 
@@ -644,7 +670,7 @@ class HomeRail(QWidget):
         # The rail: one line that scrolls sideways rather than wrapping.
         self.view.setFlow(QListView.LeftToRight)
         self.view.setWrapping(False)
-        self.view.setUniformItemSizes(True)
+        self.view.setUniformItemSizes(False)       # the cursor's card is wider
         self.view.setSpacing(4)
         # NoFocus: the keyboard belongs to the page, which drives every rail's
         # cursor. The cursor itself *is* the selection, so the poster delegate's
@@ -702,11 +728,15 @@ class HomeRail(QWidget):
     def set_cursor(self, column):
         """Put the cursor on `column`, or None to take it off this rail."""
         if column is None or not 0 <= column < self.model.rowCount():
+            had = self.view.currentIndex().isValid()
             self.view.clearSelection()
             self.view.setCurrentIndex(QModelIndex())
+            if had:
+                self.view.doItemsLayout()       # the wide card goes back to poster size
             return None
         index = self.model.index(column, 0)
         self.view.setCurrentIndex(index)
+        self.view.doItemsLayout()               # the cursor's cell is wider than the rest
         return index
 
     def activate(self, column: int):
@@ -778,6 +808,7 @@ class HomePage(QWidget):
     unpinRequested = Signal(object)          # (kind, node_type, payload)
     moveRequested = Signal(str, int)         # rail key, -1 up / +1 down
     moreRequested = Signal()                 # the bottom of the wall is in sight
+    topReached = Signal()                    # Up pressed on the first rail: reach for the nav row
     cursorChanged = Signal(str, object)      # kind, row: what the billboard shows
 
     def __init__(self, images, parent=None):
@@ -1006,6 +1037,10 @@ class HomePage(QWidget):
 
     def _move(self, d_rail: int = 0, d_column: int = 0):
         keys = self._keys()
+        position = self._position(keys)
+        if d_rail < 0 and position is not None and position[0] == 0:
+            self.topReached.emit()
+            return
         target = move_cursor(self._lengths(keys), self._position(keys),
                              d_rail, d_column)
         if target is None:
@@ -1049,17 +1084,40 @@ class HomePage(QWidget):
         if row is not None:
             self.cursorChanged.emit(index.data(ROLE_KIND) or "movie", row)
 
+    def _glide(self, bar, target: int):
+        """Slide a scroll bar to `target` instead of jumping there."""
+        target = max(bar.minimum(), min(bar.maximum(), int(target)))
+        old = getattr(bar, "_glide_anim", None)
+        if old is not None:
+            old.stop()
+        anim = QPropertyAnimation(bar, b"value", bar)
+        anim.setDuration(220)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        anim.setStartValue(bar.value())
+        anim.setEndValue(target)
+        bar._glide_anim = anim
+        anim.start()
+
     def ensure_visible(self):
-        """Follow the cursor sideways along its rail, and down the wall."""
+        """The cursor holds still at the first slot; the wall moves under it.
+
+        Sideways the selected poster is pulled to the left edge of its rail,
+        and down the wall the selected rail is pulled to the top. Near the
+        end of a rail or of the wall the scroll bars run out, and the cursor
+        walks the last few steps instead.
+        """
         if self._cursor is None:
             return
         key, column = self._cursor
         rail = self.rails.get(key)
         if rail is None or not 0 <= column < rail.rows():
             return
-        rail.view.scrollTo(rail.model.index(column, 0),
-                           QAbstractItemView.EnsureVisible)
-        self.scroll.ensureWidgetVisible(rail, 0, 0)
+        view = rail.view
+        rect = view.visualRect(rail.model.index(column, 0))
+        bar = view.horizontalScrollBar()
+        self._glide(bar, bar.value() + rect.left() - view.contentsMargins().left())
+        top = rail.mapTo(self.scroll.widget(), QPoint(0, 0)).y()
+        self._glide(self.scroll.verticalScrollBar(), top)
 
     def _cursor_pressed(self, key: str, column: int):
         """A click on a poster: the cursor goes there, and so does the keyboard.

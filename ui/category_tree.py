@@ -63,9 +63,9 @@ class CategoryDelegate(QStyledItemDelegate):
         pinnable = node[0] in PINNABLE
 
         if selected:
-            painter.fillRect(rect, QColor("#131c48"))
+            painter.fillRect(rect, QColor("#232323"))
         elif hovered:
-            painter.fillRect(rect, QColor("#101841"))
+            painter.fillRect(rect, QColor("#1f1f1f"))
 
         font = QFont(option.font)
         if pinned or is_group:
@@ -73,8 +73,8 @@ class CategoryDelegate(QStyledItemDelegate):
             font.setLetterSpacing(QFont.PercentageSpacing, 103)
         painter.setFont(font)
 
-        colour = QColor("#f5d90a") if selected else (
-            QColor("#e2e7ff") if (pinned or is_group) else QColor("#aab2da")
+        colour = QColor("#ffffff") if selected else (
+            QColor("#e5e5e5") if (pinned or is_group) else QColor("#b3b3b3")
         )
         painter.setPen(QPen(colour))
 
@@ -93,7 +93,7 @@ class CategoryDelegate(QStyledItemDelegate):
         # The pin: always shown once it is on the homepage, otherwise only
         # while the row is under the pointer.
         if pinnable and (on_home or hovered):
-            colour = "#f5d90a" if on_home else "#5c6493"
+            colour = "#e50914" if on_home else "#707070"
             pixmap = icons.pixmap("pin", colour, 14)
             box = self.pin_rect(rect)
             painter.drawPixmap(
@@ -103,7 +103,7 @@ class CategoryDelegate(QStyledItemDelegate):
 
         count = index.data(ROLE_COUNT)
         if count is not None:
-            painter.setPen(QPen(QColor("#f5d90a") if selected else QColor("#7b84b4")))
+            painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#8c8c8c")))
             painter.drawText(
                 QRect(rect.right() - 58, rect.top(), 50, rect.height()),
                 Qt.AlignVCenter | Qt.AlignRight, f"{count:,}",

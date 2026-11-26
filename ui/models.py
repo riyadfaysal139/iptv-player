@@ -307,17 +307,17 @@ class ChannelDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.State_Selected)
 
         if selected:
-            painter.fillRect(rect, QColor("#16204f"))
+            painter.fillRect(rect, QColor("#2a2a2a"))
         elif option.state & QStyle.State_MouseOver:
-            painter.fillRect(rect, QColor("#101841"))
+            painter.fillRect(rect, QColor("#1f1f1f"))
 
         available = row[6] if len(row) > 6 else 1
-        text_colour = QColor("#f5d90a") if selected else QColor("#d7dcf0")
+        text_colour = QColor("#ffffff") if selected else QColor("#e5e5e5")
         if not available:
-            text_colour = QColor("#5f6795")
+            text_colour = QColor("#707070")
 
         # index number
-        painter.setPen(QPen(QColor("#5f6795")))
+        painter.setPen(QPen(QColor("#707070")))
         num = row[5] if len(row) > 5 and row[5] else index.row() + 1
         painter.drawText(
             QRect(rect.left() + 6, rect.top(), 42, rect.height()),
@@ -336,7 +336,7 @@ class ChannelDelegate(QStyledItemDelegate):
             target.moveCenter(logo_rect.center())
             painter.drawPixmap(target, scaled)
         else:
-            painter.setPen(QPen(QColor("#1b2350")))
+            painter.setPen(QPen(QColor("#333333")))
             painter.drawRect(logo_rect)
 
         # name
@@ -350,7 +350,7 @@ class ChannelDelegate(QStyledItemDelegate):
         # favourite heart
         model = self._model()
         is_fav = model.is_favourite(row[0], index.row()) if model else False
-        painter.setPen(QPen(QColor("#f5d90a") if is_fav else QColor("#414c85")))
+        painter.setPen(QPen(QColor("#e50914") if is_fav else QColor("#666666")))
         painter.drawText(
             QRect(rect.right() - 34, rect.top(), 26, rect.height()),
             Qt.AlignCenter, "♥" if is_fav else "♡",
@@ -413,7 +413,7 @@ class PosterDelegate(QStyledItemDelegate):
         font = QFont(painter.font())
         font.setPointSizeF(11)
         painter.setFont(font)
-        painter.setPen(QPen(QColor("#f5d90a") if favourite else QColor("#ffffff")))
+        painter.setPen(QPen(QColor("#e50914") if favourite else QColor("#ffffff")))
         painter.drawText(rect.adjusted(0, -1, 0, 0), Qt.AlignCenter, "♥" if favourite else "♡")
 
     def sizeHint(self, option, index) -> QSize:
@@ -440,9 +440,9 @@ class PosterDelegate(QStyledItemDelegate):
         art = self.art_rect(option.rect)
 
         if selected:
-            painter.fillRect(option.rect, QColor("#16204f"))
+            painter.fillRect(option.rect, QColor("#2a2a2a"))
         elif option.state & QStyle.State_MouseOver:
-            painter.fillRect(option.rect, QColor("#0e1533"))
+            painter.fillRect(option.rect, QColor("#1c1c1c"))
 
         pixmap = self.images.get(row[2]) if row[2] else None
         if pixmap and not pixmap.isNull():
@@ -456,8 +456,8 @@ class PosterDelegate(QStyledItemDelegate):
             painter.drawPixmap(target, scaled)
             painter.restore()
         else:
-            painter.fillRect(art, QColor("#0d1330"))
-            painter.setPen(QPen(QColor("#3a4272")))
+            painter.fillRect(art, QColor("#181818"))
+            painter.setPen(QPen(QColor("#404040")))
             painter.drawText(art, Qt.AlignCenter | Qt.TextWordWrap, row[1][:40])
 
         # rating badge
@@ -469,7 +469,7 @@ class PosterDelegate(QStyledItemDelegate):
                 value = 0.0
             if value > 0:
                 badge = QRect(art.left(), art.top(), 34, 19)
-                painter.fillRect(badge, QColor("#c81e2a"))
+                painter.fillRect(badge, QColor("#e50914"))
                 painter.setPen(QPen(QColor("#ffffff")))
                 font = QFont(painter.font())
                 font.setPointSizeF(max(7.5, font.pointSizeF() - 1.5))
@@ -481,7 +481,7 @@ class PosterDelegate(QStyledItemDelegate):
 
         # title
         painter.setFont(QFont())
-        painter.setPen(QPen(QColor("#f5d90a") if selected else QColor("#c6cdea")))
+        painter.setPen(QPen(QColor("#ffffff") if selected else QColor("#cccccc")))
         title = QRect(cell.left(), art.bottom() + 4, cell.width(), 32)
         text = painter.fontMetrics().elidedText(row[1], Qt.ElideRight, title.width() * 2)
         painter.drawText(title, Qt.AlignTop | Qt.AlignHCenter | Qt.TextWordWrap, text)

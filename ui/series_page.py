@@ -37,6 +37,7 @@ POSTER_WIDTH_NARROW = 150
 CARD_WIDTH = 268
 CARD_IMAGE_HEIGHT = 150
 WATCHED_FRACTION = 0.95     # past this an episode counts as finished, not resumable
+CONTINUE_ROW = -2           # the cursor is on the Continue button above the seasons
 SEASON_ROW = -1             # the cursor is on the season strip, not in the grid
 FAR_END = 10 ** 6           # Home/End, expressed as a move the clamp absorbs
 
@@ -317,8 +318,9 @@ class EpisodeCard(QFrame):
         if self.property("cursorOn") == bool(on):
             return
         self.setProperty("cursorOn", bool(on))
-        self.style().unpolish(self)
-        self.style().polish(self)
+        for widget in (self, *self.findChildren(QWidget)):   # the caption's rule hangs off the card's
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -326,7 +328,7 @@ class EpisodeCard(QFrame):
             return
         painter = QPainter(self)
         bar = QRect(0, CARD_IMAGE_HEIGHT - 5, self.width(), 5)
-        painter.fillRect(bar, QColor("#1b2350"))
+        painter.fillRect(bar, QColor("#333333"))
         painter.fillRect(QRect(bar.x(), bar.y(),
                                int(bar.width() * self._progress), bar.height()),
                          QColor(icons.ACCENT))
@@ -354,6 +356,7 @@ class SeriesPage(QWidget):
     """Full-window series detail view."""
 
     backRequested = Signal()
+    topReached = Signal()                       # Up on the season strip with the page already at its top
     episodeActivated = Signal(object, int)       # episode dict, resume seconds
     episodeMenuRequested = Signal(object, object)
 
@@ -446,7 +449,7 @@ class SeriesPage(QWidget):
 
         self.continue_button = QPushButton("")
         self.continue_button.setObjectName("continueButton")
-        self.continue_button.setIcon(icons.icon("play", 18, "#06091c", "#06091c"))
+        self.continue_button.setIcon(icons.icon("play", 18, "#ffffff", "#ffffff"))
         self.continue_button.setIconSize(QSize(18, 18))
         self.continue_button.setCursor(Qt.PointingHandCursor)
         self.continue_button.clicked.connect(self._continue_clicked)
@@ -498,7 +501,7 @@ class SeriesPage(QWidget):
         whatever the provider happened to send.
         """
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#070b22"))
+        painter.fillRect(self.rect(), QColor("#141414"))
         pixmap = self._backdrop_pixmap()
         if pixmap is not None and not pixmap.isNull():
             scaled = pixmap.scaled(self.size(), Qt.KeepAspectRatioByExpanding,
@@ -506,7 +509,7 @@ class SeriesPage(QWidget):
             painter.drawPixmap(
                 (self.width() - scaled.width()) // 2,
                 (self.height() - scaled.height()) // 2, scaled)
-            painter.fillRect(self.rect(), QColor(4, 6, 18, 214))
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 214))
         super().paintEvent(event)
 
     def _backdrop_pixmap(self):
@@ -543,9 +546,9 @@ class SeriesPage(QWidget):
         if not self._plot_open and len(text) > PLOT_FOLD_CHARS:
             cut = text.rfind(" ", 0, PLOT_FOLD_CHARS)
             text = text[:cut if cut > 0 else PLOT_FOLD_CHARS].rstrip(" ,.;:") + "…"
-            row.set_text(f'{html.escape(text)} <a href="more" style="color:#f5d90a">more</a>', rich=True)
+            row.set_text(f'{html.escape(text)} <a href="more" style="color:#e50914">more</a>', rich=True)
         elif self._plot_open and len(self._plot) > PLOT_FOLD_CHARS:
-            row.set_text(f'{html.escape(text)} <a href="less" style="color:#f5d90a">less</a>', rich=True)
+            row.set_text(f'{html.escape(text)} <a href="less" style="color:#e50914">less</a>', rich=True)
         else:
             row.set_text(text)
 
@@ -741,7 +744,7 @@ class SeriesPage(QWidget):
         return self._cursor
 
     def cursor_episode(self):
-        if self._cursor is None or self._cursor == SEASON_ROW:
+        if self._cursor is None or self._cursor in (SEASON_ROW, CONTINUE_ROW):
             return None
         if 0 <= self._cursor < len(self._cards):
             return self._cards[self._cursor].episode
@@ -749,7 +752,7 @@ class SeriesPage(QWidget):
 
     def set_cursor(self, index, scroll: bool = True):
         """Put the cursor on a card, on the season strip, or nowhere."""
-        if index != SEASON_ROW:
+        if index not in (SEASON_ROW, CONTINUE_ROW):
             if not self._cards:
                 index = None
             elif index is not None:
@@ -757,6 +760,17 @@ class SeriesPage(QWidget):
         self._cursor = index
         for position, card in enumerate(self._cards):
             card.set_cursor_on(position == index)
+        strip_on = index == SEASON_ROW
+        if self.season_tabs.property("cursorOn") != strip_on:
+            self.season_tabs.setProperty("cursorOn", strip_on)
+            self.season_tabs.style().unpolish(self.season_tabs)
+            self.season_tabs.style().polish(self.season_tabs)
+        on = index == CONTINUE_ROW
+        if self.continue_button.property("cursorOn") != on:
+            self.continue_button.setProperty("cursorOn", on)
+            self.continue_button.setIcon(icons.icon("play", 18, *(["#141414"] * 2 if on else ["#ffffff"] * 2)))
+            self.continue_button.style().unpolish(self.continue_button)
+            self.continue_button.style().polish(self.continue_button)
         if scroll:
             self._scroll_to_cursor()
 
@@ -768,7 +782,9 @@ class SeriesPage(QWidget):
         return False
 
     def _scroll_to_cursor(self):
-        if self._cursor == SEASON_ROW:
+        if self._cursor == CONTINUE_ROW:
+            self.scroll.ensureWidgetVisible(self.continue_button, 0, 60)
+        elif self._cursor == SEASON_ROW:
             self.scroll.ensureWidgetVisible(self.season_tabs, 0, 0)
         elif self._cursor is not None and 0 <= self._cursor < len(self._cards):
             self.scroll.ensureWidgetVisible(self._cards[self._cursor], 0, 12)
@@ -788,6 +804,9 @@ class SeriesPage(QWidget):
         return (max(0, len(rows) - 1), max(0, rows[-1] - 1) if rows else 0)
 
     def _move(self, d_row: int = 0, d_column: int = 0):
+        if self._cursor == CONTINUE_ROW:
+            self._move_on_continue(d_row)
+            return
         if self._cursor == SEASON_ROW:
             self._move_on_seasons(d_row, d_column)
             return
@@ -811,12 +830,32 @@ class SeriesPage(QWidget):
         if d_row > 0:
             self.set_cursor(0)
             return
+        if d_row < 0 and not self.continue_button.isHidden():
+            self.set_cursor(CONTINUE_ROW)       # the button that resumes the show
+            return
+        if d_row < 0:
+            bar = self.scroll.verticalScrollBar()
+            if bar.value() > 0:
+                bar.setValue(0)             # the poster and plot above the strip
+            else:
+                self.topReached.emit()      # nothing left above: the top row
+            return
         if not d_column:
             return
         index = self.season_tabs.currentIndex() + (1 if d_column > 0 else -1)
         if 0 <= index < self.season_tabs.count():
             self.season_tabs.setCurrentIndex(index)     # drives show_season
             self._scroll_to_cursor()
+
+    def _move_on_continue(self, d_row: int):
+        if d_row > 0:
+            self.set_cursor(SEASON_ROW)
+        elif d_row < 0:
+            bar = self.scroll.verticalScrollBar()
+            if bar.value() > 0:
+                bar.setValue(0)
+            else:
+                self.topReached.emit()
 
     def _card_pressed(self, episode):
         """A click puts the cursor where you clicked, and the keyboard here."""
@@ -842,14 +881,16 @@ class SeriesPage(QWidget):
             self._move(*moves[key])
             event.accept()
             return
-        if key in (Qt.Key_Home, Qt.Key_End) and self._cursor != SEASON_ROW:
+        if key in (Qt.Key_Home, Qt.Key_End) and self._cursor not in (SEASON_ROW, CONTINUE_ROW):
             # The whole season, not the end of the line the cards happen to have
             # wrapped onto — that boundary is an accident of the pane's width.
             self.set_cursor(0 if key == Qt.Key_Home else FAR_END)
             event.accept()
             return
         if key in (Qt.Key_Return, Qt.Key_Enter):
-            if self._cursor == SEASON_ROW:
+            if self._cursor == CONTINUE_ROW:
+                self._continue_clicked()
+            elif self._cursor == SEASON_ROW:
                 self.set_cursor(0)          # into the season you just picked
             elif self._cursor is not None and 0 <= self._cursor < len(self._cards):
                 self._card_activated(self._cards[self._cursor].episode)

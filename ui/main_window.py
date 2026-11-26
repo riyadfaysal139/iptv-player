@@ -7,17 +7,19 @@ player slides in beside it on play, then folds away again when playback stops.
 
 from __future__ import annotations
 
+import os
+import json
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QEvent, QObject, QRect, QSize, Qt, QThread, QTimer, Signal,
+    QEvent, QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal,
 )
-from PySide6.QtGui import QAction, QCursor, QKeySequence, QWindow
+from PySide6.QtGui import QAction, QCursor, QKeySequence, QShortcut, QWindow
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QApplication, QComboBox, QDialog, QHBoxLayout,
+    QAbstractSpinBox, QApplication, QComboBox, QDialog, QFrame, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSplitter, QStackedWidget,
     QTabBar, QTextEdit, QVBoxLayout, QWidget,
@@ -387,6 +389,69 @@ class MainWindow(QMainWindow):
         # tree or search box cannot swallow them first. See eventFilter().
         QApplication.instance().installEventFilter(self)
 
+        # Straight to a section: Ctrl+1 Home, Ctrl+2 TV, Ctrl+3 Movies, Ctrl+4 Series.
+        for combo, action in (("Ctrl+1", self.open_home), ("Ctrl+2", lambda: self._go_tab(0)),
+                              ("Ctrl+3", lambda: self._go_tab(1)), ("Ctrl+4", lambda: self._go_tab(2))):
+            shortcut = QShortcut(QKeySequence(combo), self)
+            shortcut.setContext(Qt.ApplicationShortcut)
+            shortcut.activated.connect(action)
+
+        # Tell the phone remote where we are, so its buttons can follow the screen.
+        self._reported_state = None
+        self._state_timer = QTimer(self)
+        self._state_timer.timeout.connect(self._report_state)
+        self._state_timer.start(400)
+        self._seek_seen = -1
+        self._seek_timer = QTimer(self)
+        self._seek_timer.timeout.connect(self._phone_seek)
+        self._seek_timer.start(150)
+
+    SEEK_FILE = "/tmp/iptv-player-seek.json"
+
+    def _phone_seek(self):
+        """The phone remote dragged its progress bar: jump there."""
+        try:
+            with open(self.SEEK_FILE) as f:
+                cmd = json.load(f)
+            if cmd["n"] == self._seek_seen:
+                return
+            self._seek_seen = cmd["n"]
+            if time.time() - os.path.getmtime(self.SEEK_FILE) < 5 and self.player.available and self.player.has_media:
+                self.player.seek_fraction(float(cmd["f"]))
+                self.player.refresh_now()
+        except Exception:
+            pass
+
+    STATE_FILE = "/tmp/iptv-player-state.json"
+
+    def _report_state(self):
+        """Write {"playing", "section"} for the remote whenever either changes (and as a heartbeat)."""
+        try:
+            playing = bool(self.player.available and self.player.has_media)
+            if self.home_open:
+                section = "home"
+            elif self.search_open:
+                section = "search"
+            elif self.series_open:
+                section = "series"
+            else:
+                section = {"live": "tv", "movie": "movies", "series": "series"}.get(self.kind, "tv")
+            state = {"playing": playing, "section": section}
+            if playing:
+                length = self.player.duration_secs()
+                state.update(pos=self.player.position_secs(), len=length, title=self.player.current_title or "",
+                             seekable=bool(getattr(self.player, "_seekable", False)) and length > 0)
+            self._state_beat = getattr(self, "_state_beat", 0) + 1
+            if state == self._reported_state and self._state_beat % 5:
+                return
+            self._reported_state = state
+            tmp = self.STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, self.STATE_FILE)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------ ui
 
     def _build_ui(self):
@@ -459,6 +524,16 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(nav)
         top_layout.addStretch(1)
         outer.addWidget(top)
+
+        # Remote-control navigation: arrows can reach the pills above (see
+        # _nav_*). The ring is a child of the nav bar so it follows the layout.
+        self._nav_widget = nav
+        self._nav_index = None
+        self._nav_ring = QFrame(nav)
+        self._nav_ring.setStyleSheet(
+            "border: 2px solid #ffffff; border-radius: 9px; background: transparent;")
+        self._nav_ring.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._nav_ring.hide()
 
         splitter = QSplitter(Qt.Horizontal)
         self._splitter = splitter
@@ -584,7 +659,15 @@ class MainWindow(QMainWindow):
             "Open this stream in the full VLC application, where the original "
             "VLSub extension is available."
         )
-        for button in (self.subs_button, self.download_button, self.vlc_button):
+        self.mpv_button = QPushButton("Open in mpv")
+        self.mpv_button.clicked.connect(self.open_in_mpv)
+        self.mpv_button.setToolTip(
+            "Open this stream in mpv, which tone-maps HDR video correctly on "
+            "an SDR screen."
+        )
+        for button in (
+            self.subs_button, self.download_button, self.vlc_button, self.mpv_button,
+        ):
             buttons.addWidget(button)
         buttons.addStretch(1)
         info_layout.addLayout(buttons)
@@ -1091,7 +1174,7 @@ class MainWindow(QMainWindow):
         widget.setProperty(name, bool(on))
         if glyph:
             # Lit pills are white, so the icon on one goes dark.
-            widget.setIcon(icons.icon(glyph, 19, "#0b0f2b" if on else icons.FG))
+            widget.setIcon(icons.icon(glyph, 19, "#141414" if on else icons.FG))
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
@@ -1289,6 +1372,7 @@ class MainWindow(QMainWindow):
         self.player.play(self._cached_url(self._playable_url(url), ext, is_live),
                          name, is_live=is_live, resume_secs=resume, immediate=True)
         self._load_epg(row, kind)
+        self._go_fullscreen()
 
     def play_local(self, path: str, title: str):
         """Downloaded files play from disk and use no connection."""
@@ -1302,6 +1386,7 @@ class MainWindow(QMainWindow):
         self.live_badge.hide()
         self.player.play(Path(path).absolute().as_uri(), title, is_live=False)
         self._clear_epg()
+        self._go_fullscreen()
 
     def _on_player_error(self, message):
         # If the cache proxy is what failed (an upstream with no length, say),
@@ -1803,6 +1888,11 @@ class MainWindow(QMainWindow):
                 self.showMaximized()
         finally:
             self._state_hook_muted = False
+
+    def _go_fullscreen(self):
+        """Whatever starts playing takes the whole screen."""
+        if not self._fs_state:
+            QTimer.singleShot(0, self.enter_fullscreen)
 
     def enter_fullscreen(self):
         """Give the whole screen to the video.
@@ -2491,8 +2581,12 @@ class MainWindow(QMainWindow):
         consume Space. Filtering at the application level is what makes the
         shortcuts work no matter where focus happens to be.
         """
+        if event.type() == QEvent.KeyPress and self._nav_key(event):
+            return True
         if event.type() == QEvent.KeyPress and self._handle_player_key(event):
             return True
+        if event.type() == QEvent.KeyPress:
+            self._nav_watch_list_top(event)
         if event.type() == QEvent.MouseMove and isinstance(obj, QWindow) and self._app_fullscreen:
             # Every move reaches the window even when the widget under the
             # pointer has no mouse tracking; the edge strips read this.
@@ -2500,6 +2594,87 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Wheel and self._handle_player_wheel(event, obj):
             return True
         return super().eventFilter(obj, event)
+
+    # ----------------------------------------------- arrows reach the top row
+
+    def _nav_targets(self):
+        return [self.search_button, self.home_button, ("tab", 0), ("tab", 1), ("tab", 2)]
+
+    def _go_tab(self, index):
+        self._reveal_browser()
+        if self.tab_bar.currentIndex() == index:
+            self._tab_changed(index)
+        else:
+            self.tab_bar.setCurrentIndex(index)
+
+    def _nav_enter(self, index=1):
+        """Put the highlight on the top row (Search, Home, TV, Movies, Series)."""
+        self._nav_index = index
+        self._nav_paint()
+
+    def _nav_leave(self, refocus=True):
+        self._nav_index = None
+        self._nav_ring.hide()
+        if refocus:
+            self._return_focus()
+
+    def _nav_paint(self):
+        target = self._nav_targets()[self._nav_index]
+        if isinstance(target, tuple):
+            rect = self.tab_bar.tabRect(target[1])
+            top_left = self.tab_bar.mapTo(self._nav_widget, rect.topLeft())
+            size = rect.size()
+        else:
+            top_left = target.mapTo(self._nav_widget, QPoint(0, 0))
+            size = target.size()
+        self._nav_ring.setGeometry(QRect(top_left, size).adjusted(-2, -2, 2, 2))
+        self._nav_ring.show()
+        self._nav_ring.raise_()
+
+    def _nav_activate(self):
+        index = self._nav_index
+        self._nav_leave(refocus=False)
+        if index == 0:
+            self.open_search()
+        elif index == 1:
+            self.open_home()
+        else:
+            self._go_tab(index - 2)
+
+    def _nav_key(self, event) -> bool:
+        """While the top row holds the highlight: Left/Right move it, Enter opens
+        it, Down or Escape hands the arrows back to the content."""
+        if self._nav_index is None or event.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+            return False
+        key = event.key()
+        count = len(self._nav_targets())
+        if key == Qt.Key_Left:
+            self._nav_index = max(0, self._nav_index - 1)
+            self._nav_paint()
+        elif key == Qt.Key_Right:
+            self._nav_index = min(count - 1, self._nav_index + 1)
+            self._nav_paint()
+        elif key in (Qt.Key_Return, Qt.Key_Enter):
+            self._nav_activate()
+        elif key in (Qt.Key_Down, Qt.Key_Escape, Qt.Key_Back):
+            self._nav_leave()
+        elif key == Qt.Key_Up:
+            pass                                  # already at the top
+        else:
+            return False
+        return True
+
+    def _nav_watch_list_top(self, event):
+        """Up at the first item of a channel or poster list goes to the top row."""
+        if (event.key() != Qt.Key_Up or event.modifiers()
+                or self._nav_index is not None or not self.list_view.isVisible()):
+            return
+        focused = QApplication.focusWidget()
+        if focused is not self.list_view and focused is not self.list_view.viewport():
+            return
+        before = self.list_view.currentIndex()
+        QTimer.singleShot(0, lambda: self._nav_enter(2 + [t[0] for t in TABS].index(self.kind))
+                          if self.list_view.currentIndex() == before else None)
 
     @staticmethod
     def _is_typing() -> bool:
@@ -2606,6 +2781,26 @@ class MainWindow(QMainWindow):
             return False
         key = event.key()
 
+        if key == Qt.Key_Back:
+            # The phone remote's Back: it closes what sits on top, then stops playback.
+            # While something plays it never leaves fullscreen; once it has stopped, it does.
+            if self._fs_state and self.drawer_open:
+                self._close_drawer()
+            elif self.series_open:
+                self.close_series()
+            elif self.search_open:
+                self.close_search()
+            elif self.home_open:
+                self.close_home()
+            elif self.player.available and self.player.has_media:
+                self.player.stop()
+                self._key_feedback("Stopped")
+                if self._fs_state:
+                    self.exit_fullscreen()      # stopped: back to the screen it started from
+            elif self._fs_state:
+                self.exit_fullscreen()          # nothing playing, nothing to hold fullscreen for
+            return True
+
         if key == Qt.Key_Escape and self._fs_state:
             if self.drawer_open:
                 self._close_drawer()
@@ -2644,6 +2839,12 @@ class MainWindow(QMainWindow):
             return False
         if not self.player.available or self._is_typing():
             return False
+
+        if key == Qt.Key_Escape and self.player.has_media:
+            # Nothing left to close: Esc (the remote's Back) stops what is playing.
+            self.player.stop()
+            self._key_feedback("Stopped")
+            return True
 
         if key == Qt.Key_Space:
             self.player.toggle_pause()
@@ -2763,6 +2964,7 @@ class MainWindow(QMainWindow):
         self.home_page.unpinRequested.connect(self._unpin_rail)
         self.home_page.moveRequested.connect(self.move_rail)
         self.home_page.moreRequested.connect(self._load_more_home)
+        self.home_page.topReached.connect(lambda: self._nav_enter(1))
         self._home_offset = 0
         self.stack.addWidget(self.home_page)
 
@@ -3119,6 +3321,7 @@ class MainWindow(QMainWindow):
     def _build_series_page(self):
         self.series_page = SeriesPage(self.images)
         self.series_page.backRequested.connect(self.close_series)
+        self.series_page.topReached.connect(lambda: self._nav_enter(4))
         self.series_page.episodeActivated.connect(self._play_episode)
         self.series_page.episodeMenuRequested.connect(self._episode_menu)
         self.stack.addWidget(self.series_page)
@@ -3253,6 +3456,7 @@ class MainWindow(QMainWindow):
         self._play_original_url = url
         self.player.play(self._cached_url(url, episode["ext"], False), title,
                          is_live=False, resume_secs=int(resume_secs or 0))
+        self._go_fullscreen()
 
     def _episode_menu(self, episode, position):
         menu = QMenu(self)
@@ -3580,6 +3784,25 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Opened in VLC", 4000)
         except Exception as exc:
             self.statusBar().showMessage(f"Could not launch VLC: {exc}", 6000)
+
+    def open_in_mpv(self):
+        url = self.player.current_url
+        if not url:
+            self.statusBar().showMessage("Nothing is playing", 4000)
+            return
+        binary = vlc_setup.mpv_app_binary()
+        if binary is None:
+            QMessageBox.information(
+                self, "mpv not found",
+                "mpv was not found on this computer. Install it (for example "
+                "`sudo apt install mpv`) and try again.",
+            )
+            return
+        try:
+            subprocess.Popen([str(binary), url])
+            self.statusBar().showMessage("Opened in mpv", 4000)
+        except Exception as exc:
+            self.statusBar().showMessage(f"Could not launch mpv: {exc}", 6000)
 
     def choose_download_dir(self):
         from PySide6.QtWidgets import QFileDialog
