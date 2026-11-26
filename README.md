@@ -409,6 +409,14 @@ ratio/crop/deinterlace, and the audio and subtitle track menus — and hides fro
 Controls a live stream cannot honour (seek, frame-step, A↔B, speed) grey out on
 live channels.
 
+**The screen stays on while something is playing.** No desktop treats a libVLC
+window as playback on its own, so each one would otherwise dim and lock
+mid-film. macOS gets an `IOPMAssertion` (`kIOPMAssertionTypeNoDisplaySleep`) and
+Windows gets `SetThreadExecutionState` with `ES_DISPLAY_REQUIRED`; both are
+dropped on stop, on pause and at shutdown, so a paused film does not pin the
+display lit behind a frozen frame. Linux needs nothing — the shell inhibits the
+screensaver for a fullscreen video window itself.
+
 ### Keyboard
 
 | Key | Action |

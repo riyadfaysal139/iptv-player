@@ -94,7 +94,8 @@ def selftest() -> int:
 def _run_selftest(importlib) -> int:
     modules = [
         "core.api", "core.classify", "core.db", "core.downloads", "core.m3u",
-        "core.playlists", "core.subtitles", "core.sync", "core.vlc_setup",
+        "core.playlists", "core.screen_awake", "core.subtitles", "core.sync",
+        "core.vlc_setup",
         "core.vlsub",
         "ui.category_tree", "ui.downloads_panel", "ui.effects_dialog",
         "ui.icons", "ui.main_window", "ui.models", "ui.player_widget",

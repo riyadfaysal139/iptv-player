@@ -2822,12 +2822,12 @@ class TestPackagingManifest(unittest.TestCase):
 
 
 class TestScreenAwake(unittest.TestCase):
-    """The macOS display assertion.
+    """The keep-the-display-on request.
 
-    The assertion itself cannot be exercised off a Mac - IOKit is absent
-    everywhere else - so what is covered here is the part that must hold on
-    every platform: it is a no-op that never raises, and holding and
-    releasing are both idempotent.
+    The real IOKit and Win32 calls cannot be made off their own platforms, so
+    the backends are exercised through fakes here. What is covered: the state
+    machine never asks twice, always releases, survives a backend that fails,
+    and is a no-op on Linux.
     """
 
     def test_importable_and_constructible(self):
@@ -2835,33 +2835,159 @@ class TestScreenAwake(unittest.TestCase):
 
         self.assertFalse(ScreenAwake().held)
 
-    def test_hold_is_false_off_macos(self):
+    def test_hold_is_false_off_macos_and_windows(self):
         from core import screen_awake
 
-        if sys.platform == "darwin":
-            self.skipTest("IOKit is present here; the no-op path does not apply")
+        if sys.platform in ("darwin", "win32"):
+            self.skipTest("a real backend is present here")
         self.assertFalse(screen_awake.ScreenAwake().hold())
 
-    def test_hold_is_idempotent(self):
+    def test_no_op_on_linux_has_no_backend(self):
+        from core import screen_awake
+
+        if sys.platform in ("darwin", "win32"):
+            self.skipTest("a real backend is present here")
+        self.assertIsNone(screen_awake.ScreenAwake()._backend)
+
+    def _fake(self, idle, calls):
+        class Fake:
+            def load(self):
+                return True
+
+            def hold(self):
+                calls.append("hold")
+                return "token"
+
+            def release(self, token):
+                calls.append(("release", token))
+
         from core.screen_awake import ScreenAwake
 
         awake = ScreenAwake()
-        first = awake.hold()
-        second = awake.hold()
-        self.assertEqual(first, second, "a second hold must not change the outcome")
+        awake._backend = Fake()
+        awake._token = idle
+        return awake
 
-    def test_release_without_hold_is_safe(self):
-        from core.screen_awake import ScreenAwake
-
-        awake = ScreenAwake()
-        awake.release()
+    def test_hold_then_release_pairs_up(self):
+        calls = []
+        awake = self._fake(None, calls)
+        self.assertTrue(awake.hold())
+        self.assertTrue(awake.held)
         awake.release()
         self.assertFalse(awake.held)
+        self.assertEqual(calls, ["hold", ("release", "token")])
 
-    def test_hold_then_release_returns_to_rest(self):
-        from core.screen_awake import ScreenAwake
+    def test_hold_twice_only_asks_once(self):
+        calls = []
+        awake = self._fake(None, calls)
+        awake.hold()
+        awake.hold()
+        self.assertEqual(calls, ["hold"], "a second hold must not double up")
 
-        awake = ScreenAwake()
+    def test_release_twice_only_releases_once(self):
+        calls = []
+        awake = self._fake(None, calls)
         awake.hold()
         awake.release()
+        awake.release()
+        self.assertEqual(calls, ["hold", ("release", "token")])
+
+    def test_release_without_hold_is_safe(self):
+        calls = []
+        awake = self._fake(None, calls)
+        awake.release()
+        self.assertEqual(calls, [])
+
+    def test_failing_backend_reports_not_held(self):
+        from core.screen_awake import ScreenAwake
+
+        class Broken:
+            def load(self):
+                return True
+
+            def hold(self):
+                return None
+
+            def release(self, token):
+                raise AssertionError("must not be called")
+
+        awake = ScreenAwake()
+        awake._backend = Broken()
+        self.assertFalse(awake.hold())
         self.assertFalse(awake.held)
+        awake.release()  # must not raise
+
+    def test_backend_that_cannot_load_is_harmless(self):
+        from core.screen_awake import ScreenAwake
+
+        class Missing:
+            def load(self):
+                return False
+
+        awake = ScreenAwake()
+        awake._backend = Missing()
+        self.assertFalse(awake.hold())
+        self.assertFalse(awake.held)
+
+    def test_release_swallows_backend_errors(self):
+        from core.screen_awake import ScreenAwake
+
+        class Explodes:
+            def load(self):
+                return True
+
+            def hold(self):
+                return "token"
+
+            def release(self, token):
+                raise OSError("device went away")
+
+        awake = ScreenAwake()
+        awake._backend = Explodes()
+        self.assertTrue(awake.hold())
+        awake.release()  # must not raise
+        self.assertFalse(awake.held)
+
+
+class TestWindowsExecutionState(unittest.TestCase):
+    """SetThreadExecutionState gets the right flags.
+
+    Worth pinning down: ES_CONTINUOUS is 0x80000000, which overflows a signed
+    32-bit int, so the value handed to ctypes must be declared unsigned or the
+    flag silently arrives as a negative number and the monitor still sleeps.
+    """
+
+    def _backend(self, calls):
+        from core.screen_awake import _WindowsBackend
+
+        backend = _WindowsBackend()
+
+        def fake_set_state(flags):
+            calls.append(flags)
+            return 1
+
+        backend._loaded = True
+        backend._set_state = fake_set_state
+        return backend
+
+    def test_hold_sets_continuous_and_display_required(self):
+        from core import screen_awake
+
+        calls = []
+        token = self._backend(calls).hold()
+        self.assertIsNotNone(token)
+        self.assertEqual(calls, [screen_awake._ES_CONTINUOUS | screen_awake._ES_DISPLAY_REQUIRED])
+
+    def test_release_clears_with_continuous_only(self):
+        from core import screen_awake
+
+        calls = []
+        backend = self._backend(calls)
+        backend.release(backend.hold())
+        self.assertEqual(calls[-1], screen_awake._ES_CONTINUOUS)
+
+    def test_continuous_flag_is_unsigned(self):
+        from core import screen_awake
+
+        self.assertEqual(screen_awake._ES_CONTINUOUS, 0x80000000)
+        self.assertEqual(screen_awake._ES_DISPLAY_REQUIRED, 0x00000002)
