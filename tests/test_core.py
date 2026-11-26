@@ -2991,3 +2991,56 @@ class TestWindowsExecutionState(unittest.TestCase):
 
         self.assertEqual(screen_awake._ES_CONTINUOUS, 0x80000000)
         self.assertEqual(screen_awake._ES_DISPLAY_REQUIRED, 0x00000002)
+
+
+class TestVideoAreaForFloatingBar(unittest.TestCase):
+    """Where the fullscreen bar is placed.
+
+    The bar is a top-level window, so it needs an explicit rectangle. Basing
+    that on self.screen() put it on the wrong monitor when a fullscreen
+    transition had not finished: Qt still described the window as it was
+    before the switch. The window's own geometry is the video's rectangle in
+    fullscreen, so it is preferred.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication([])
+
+    def area(self, frame):
+        """Call the real method against a stub that only offers geometry."""
+        from ui.main_window import MainWindow
+
+        class Stub:
+            def frameGeometry(self_inner):
+                return frame
+
+            def screen(self_inner):
+                return self.app.primaryScreen()
+
+        return MainWindow._video_area(Stub())
+
+    def test_uses_the_window_rectangle_when_it_is_on_a_screen(self):
+        from PySide6.QtCore import QRect
+
+        screen = self.app.primaryScreen().geometry()
+        frame = QRect(screen.x(), screen.y(), max(1, screen.width() - 10),
+                      max(1, screen.height() - 10))
+        got = self.area(frame)
+        self.assertEqual((got.x(), got.y()), (frame.x(), frame.y()))
+
+    def test_falls_back_to_the_screen_when_geometry_is_empty(self):
+        from PySide6.QtCore import QRect
+
+        screen = self.app.primaryScreen().geometry()
+        got = self.area(QRect())
+        self.assertEqual((got.x(), got.y(), got.width(), got.height()),
+                         (screen.x(), screen.y(), screen.width(), screen.height()))
+
+    def test_ignores_a_rectangle_that_is_on_no_screen(self):
+        from PySide6.QtCore import QRect
+
+        got = self.area(QRect(-90000, -90000, 800, 600))
+        self.assertEqual(got, self.app.primaryScreen().geometry())

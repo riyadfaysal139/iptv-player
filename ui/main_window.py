@@ -1936,6 +1936,11 @@ class MainWindow(QMainWindow):
         self._set_native_chrome(True)
         self._fill_screen()
         self._float_bar(with_drawer=True)
+        # The window's screen is only final once the transition has run; the
+        # bar is re-placed on the next event-loop turn and again after the
+        # macOS fullscreen animation, so it cannot be left on the old monitor.
+        QTimer.singleShot(0, self._settle_bar_on_video)
+        QTimer.singleShot(400, self._settle_bar_on_video)
         # The overlay is a separate top-level and takes activation with it, so
         # claim it back and put focus on the video — otherwise nothing holds
         # focus at all and the keyboard has no obvious owner.
@@ -2079,10 +2084,16 @@ class MainWindow(QMainWindow):
         if not self.db.get_bool("fullscreen_floating_bar", True):
             return
         if area is None:
+            area = self._video_area() if self._fs_state else None
+        if area is None:
             screen = self.screen() or QApplication.primaryScreen()
             if screen is None:
                 return
             area = screen.geometry()
+
+        # Kept so the bar can be put back over the video once a fullscreen
+        # transition has finished and the screen is finally known.
+        self._fs_bar_inset, self._fs_bar_gap = inset, gap
 
         width = max(200, min(max_width, area.width() - inset))
         left = area.x() + (area.width() - width) // 2
@@ -2217,6 +2228,44 @@ class MainWindow(QMainWindow):
             self._fs_chevron.setText("⌃")
         self._fs_idle_ms = 0
         self._restore_cursor()
+
+    def _settle_bar_on_video(self):
+        """Put the floating bar back over the video once the screen is known.
+
+        The bar is created against the window's geometry as it stands, but a
+        fullscreen transition finishes asynchronously - macOS in particular
+        moves the window to its own Space - so the coordinates used a moment
+        ago can belong to the monitor the window came from. Recomputing here,
+        on the next event-loop turn and again once the animation has had time
+        to finish, is what actually keeps the bar with the picture.
+        """
+        overlay = self._fs_overlay
+        if overlay is None or not self._fs_state or self.drawer_open:
+            return
+        area = self._video_area()
+        if area is None:
+            return
+        inset = getattr(self, "_fs_bar_inset", 80)
+        gap = getattr(self, "_fs_bar_gap", 28)
+        # A parentless Tool window is placed by the window server on whatever
+        # screen it considers current, and macOS in particular keeps windows
+        # near the menu bar rather than following a move() to another monitor.
+        # Naming the screen first is what lets the bar cross displays at all.
+        target = QApplication.screenAt(area.center())
+        handle = overlay.windowHandle()
+        if target is not None and handle is not None and handle.screen() is not target:
+            try:
+                handle.setScreen(target)
+            except (AttributeError, TypeError):
+                pass
+        width = max(200, min(overlay.width() or 1100, area.width() - inset))
+        left = area.x() + (area.width() - width) // 2
+        if width != overlay.width():
+            overlay.setFixedWidth(width)
+        overlay.move(left, area.y() + area.height() - overlay.height() - gap)
+        self._fs_bar_home = overlay.pos()
+        overlay.show()
+        overlay.raise_()
 
     def _settle_bar_on_drawer(self):
         overlay = self._fs_overlay
@@ -2489,6 +2538,26 @@ class MainWindow(QMainWindow):
         screen = self.screen() or QApplication.primaryScreen()
         area = screen.availableGeometry() if screen is not None else self.geometry()
         return (area.x(), area.y(), area.width(), area.height())
+
+    def _video_area(self):
+        """The rectangle the video actually occupies, for placing the bar.
+
+        `self.screen()` is not dependable at the moment the bar is placed. On
+        macOS a fullscreen window gets its own Space and the transition is
+        asynchronous, so Qt can still describe the window as it was before the
+        switch - which puts the floating bar on the monitor the window came
+        from while the video is on the other one.
+
+        In fullscreen the window *is* the video, so its own geometry is the
+        answer; the screen is only used to reject a stale or off-desktop
+        rectangle. Falls back to the screen when there is nothing to trust.
+        """
+        frame = self.frameGeometry()
+        if frame.isValid() and frame.width() > 0 and frame.height() > 0:
+            if QApplication.screenAt(frame.center()) is not None:
+                return frame
+        screen = self.screen() or QApplication.primaryScreen()
+        return screen.geometry() if screen is not None else None
 
     def _pip_width(self) -> int:
         try:

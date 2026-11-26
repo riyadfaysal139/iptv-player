@@ -8,7 +8,7 @@
 ; because a DLL/app bitness mismatch is the most common failure on Windows.
 
 #define AppName        "IPTV Player"
-#define AppVersion     "1.5.0"
+#define AppVersion     "1.5.1"
 #define AppPublisher   "IPTV Player"
 #define AppExeName     "IPTVPlayer.exe"
 #define VlcUrl         "https://www.videolan.org/vlc/"

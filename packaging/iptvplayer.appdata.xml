@@ -45,6 +45,14 @@
   </provides>
 
   <releases>
+    <release version="1.5.1" date="2026-11-26">
+      <description>
+        <p>The fullscreen control bar follows the picture onto whichever
+        monitor is showing the video. It could land on the display the window
+        came from, because a fullscreen transition finishes asynchronously and
+        the screen was read before it had.</p>
+      </description>
+    </release>
     <release version="1.5.0" date="2026-11-25">
       <description>
         <p>The display stays awake while something is playing, on macOS and
