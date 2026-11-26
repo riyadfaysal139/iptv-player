@@ -2819,3 +2819,49 @@ class TestPackagingManifest(unittest.TestCase):
                 f"pulls in, and is not in the spec's hiddenimports - the frozen build "
                 f"will not contain it",
             )
+
+
+class TestScreenAwake(unittest.TestCase):
+    """The macOS display assertion.
+
+    The assertion itself cannot be exercised off a Mac - IOKit is absent
+    everywhere else - so what is covered here is the part that must hold on
+    every platform: it is a no-op that never raises, and holding and
+    releasing are both idempotent.
+    """
+
+    def test_importable_and_constructible(self):
+        from core.screen_awake import ScreenAwake
+
+        self.assertFalse(ScreenAwake().held)
+
+    def test_hold_is_false_off_macos(self):
+        from core import screen_awake
+
+        if sys.platform == "darwin":
+            self.skipTest("IOKit is present here; the no-op path does not apply")
+        self.assertFalse(screen_awake.ScreenAwake().hold())
+
+    def test_hold_is_idempotent(self):
+        from core.screen_awake import ScreenAwake
+
+        awake = ScreenAwake()
+        first = awake.hold()
+        second = awake.hold()
+        self.assertEqual(first, second, "a second hold must not change the outcome")
+
+    def test_release_without_hold_is_safe(self):
+        from core.screen_awake import ScreenAwake
+
+        awake = ScreenAwake()
+        awake.release()
+        awake.release()
+        self.assertFalse(awake.held)
+
+    def test_hold_then_release_returns_to_rest(self):
+        from core.screen_awake import ScreenAwake
+
+        awake = ScreenAwake()
+        awake.hold()
+        awake.release()
+        self.assertFalse(awake.held)
