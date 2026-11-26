@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from core import vlc_setup
+from core.screen_awake import ScreenAwake
 from ui.transport_bar import TransportBar
 
 SWITCH_DEBOUNCE_MS = 300
@@ -434,6 +435,11 @@ class PlayerWidget(QWidget):
         self._up_next_mode = "next"
 
         self._keepalive = _AudioKeepAlive()
+        # The display assertion is the macOS counterpart to the audio keep-alive
+        # below, but for the screen rather than the sound: macOS never infers
+        # "a film is playing" from a libVLC surface, so without this the display
+        # dims and locks mid-stream while the audio carries on. No-op elsewhere.
+        self._awake = ScreenAwake()
         # The keep-alive only runs around actual playback: started when a stream
         # starts, stopped a short while after everything stops. That spans the
         # pauses and channel-hops that pop the audio device without holding it
@@ -718,6 +724,7 @@ class PlayerWidget(QWidget):
             self._disown_input()
             self._keepalive_off.stop()
             self._keepalive.start()
+            self._awake.hold()
             self._poll.start()
             self._claim_focus()
             self.playbackStarted.emit()
@@ -882,6 +889,7 @@ class PlayerWidget(QWidget):
         # Let the device idle only after a grace period - a stop is very often
         # the front half of a channel change.
         self._keepalive_off.start()
+        self._awake.release()
         self.playbackStopped.emit()
 
     def toggle_pause(self):
@@ -893,6 +901,12 @@ class PlayerWidget(QWidget):
         if self.player is None or not self._current_url:
             return
         self.player.pause()
+        # Paused is not watching: let the display sleep again rather than
+        # pinning it lit behind a frozen frame.
+        if self.player.is_playing():
+            self._awake.hold()
+        else:
+            self._awake.release()
         self.bar.set_playing(bool(self.player.is_playing()))
 
     @property
@@ -1349,4 +1363,5 @@ class PlayerWidget(QWidget):
         self._switch_timer.stop()
         self._keepalive_off.stop()
         self._keepalive.stop()
+        self._awake.release()
         self._release_player()
